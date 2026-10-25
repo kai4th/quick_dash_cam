@@ -16,7 +16,6 @@ from typing import Dict, List, Optional, Tuple
 import customtkinter as ctk
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
 
 from .analyzer import analyze_video, reclassify_from_cache
 from .ffmpeg_utils import (
@@ -71,6 +70,30 @@ def format_duration(seconds: float, include_tenths: bool = False) -> str:
     return f"{base}.{tenths}" if include_tenths else base
 
 
+def make_photo_image(img_or_arr: Union[np.ndarray, object]) -> tk.PhotoImage:
+    """
+    RGB uint8 NumPy 배열((H, W, 3) 또는 (H, W))을 Tkinter 네이티브 PhotoImage로 고속 변환합니다.
+    외부 C 확장 DLL(_imagingtk.pyd 등)에 의존하지 않고 Netpbm(P6/P5) 바이너리 포맷을
+    Tcl/Tk 코어에 직접 전달하므로, Windows Application Control(WDAC, Smart App Control)이나
+    파이썬 버전(3.14+)에 구애받지 않고 100% 안전하고 빠르게 동작합니다.
+    """
+    if not isinstance(img_or_arr, np.ndarray):
+        arr = np.asarray(img_or_arr)
+    else:
+        arr = img_or_arr
+
+    if not arr.flags["C_CONTIGUOUS"]:
+        arr = np.ascontiguousarray(arr)
+
+    if arr.ndim == 2:
+        h, w = arr.shape
+        ppm = f"P5 {w} {h} 255\n".encode("ascii") + arr.tobytes()
+    else:
+        h, w = arr.shape[:2]
+        ppm = f"P6 {w} {h} 255\n".encode("ascii") + arr.tobytes()
+    return tk.PhotoImage(data=ppm)
+
+
 class PreviewFrameWorker:
     """
     마우스 드래그로 전체 타임라인을 빠르게 탐색(Scrubbing)할 때
@@ -114,6 +137,7 @@ class PreviewFrameWorker:
                 continue
 
             v_path, local_sec, max_w, max_h, req_id = req
+            bgr: Optional[np.ndarray] = None
             try:
                 if self._cap is None or self._cap_path != v_path:
                     if self._cap is not None:
@@ -121,26 +145,58 @@ class PreviewFrameWorker:
                     self._cap = cv2.VideoCapture(str(v_path))
                     self._cap_path = v_path
 
-                if not self._cap or not self._cap.isOpened():
-                    continue
+                if self._cap and self._cap.isOpened():
+                    self._cap.set(cv2.CAP_PROP_POS_MSEC, local_sec * 1000.0)
+                    ret, frame = self._cap.read()
+                    if not ret or frame is None:
+                        self._cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, local_sec - 0.15) * 1000.0)
+                        ret, frame = self._cap.read()
+                    if ret and frame is not None:
+                        bgr = frame
+            except Exception:
+                bgr = None
 
-                self._cap.set(cv2.CAP_PROP_POS_MSEC, local_sec * 1000.0)
-                ret, bgr = self._cap.read()
-                if not ret or bgr is None:
-                    # 파일 끝 근처에서 읽기 실패 시 살짝 앞쪽 프레임 시도
-                    self._cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, local_sec - 0.15) * 1000.0)
-                    ret, bgr = self._cap.read()
-                if not ret or bgr is None:
-                    continue
+            # OpenCV 디코딩 실패 시 FFmpeg 1프레임 즉시 추출 폴백
+            if bgr is None:
+                try:
+                    ff = get_ffmpeg_exe()
+                    cmd = [
+                        ff,
+                        "-hide_banner",
+                        "-loglevel", "error",
+                        "-nostdin",
+                        "-ss", f"{max(0.0, local_sec):.3f}",
+                        "-i", str(v_path),
+                        "-frames:v", "1",
+                        "-vf", f"scale={max_w}:{max_h}:force_original_aspect_ratio=decrease",
+                        "-f", "image2pipe",
+                        "-vcodec", "png",
+                        "-",
+                    ]
+                    res = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2.0,
+                        creationflags=get_CreationFlags(),
+                    )
+                    if res.returncode == 0 and res.stdout:
+                        nparr = np.frombuffer(res.stdout, np.uint8)
+                        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                except Exception:
+                    bgr = None
 
+            if bgr is None:
+                continue
+
+            try:
                 h, w = bgr.shape[:2]
                 scale = min(max_w / max(1, w), max_h / max(1, h))
                 new_w = max(1, int(round(w * scale)))
                 new_h = max(1, int(round(h * scale)))
                 resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(rgb)
-                self._on_frame_ready(pil_img, req_id)
+                self._on_frame_ready(rgb, req_id)
             except Exception:
                 continue
 
@@ -905,7 +961,7 @@ class QuickDashCamApp(ctk.CTk):
         self.cut_out_sec: Optional[float] = None
         self.is_playing_preview: bool = False
         self._last_play_tick: float = 0.0
-        self._preview_photo: Optional[ImageTk.PhotoImage] = None
+        self._preview_photo: Optional[tk.PhotoImage] = None
         self._undo_stack: List[Tuple[List[List[Segment]], List[ReviewItem]]] = []
 
         # 스트리밍 재생 상태
@@ -1818,7 +1874,7 @@ class QuickDashCamApp(ctk.CTk):
             sid, media_t, arr = item
             if sid == self._play_session:
                 self.playhead_sec = media_t
-                self._draw_preview_image(Image.fromarray(arr))
+                self._draw_preview_image(arr)
                 self.global_timeline.set_playhead(media_t)
                 now = time.perf_counter()
                 if now - self._last_label_update > 0.12:
@@ -2039,18 +2095,25 @@ class QuickDashCamApp(ctk.CTk):
         ch = max(90, self.preview_canvas.winfo_height())
         self._preview_worker.request_frame(video.path, local_t, cw, ch)
 
-    def _on_worker_frame_ready(self, pil_img: Image.Image, _req_id: int) -> None:
+    def _on_worker_frame_ready(self, frame_arr: np.ndarray, _req_id: int) -> None:
         def draw():
             if not self.videos or self.is_playing_preview:
                 return
-            self._draw_preview_image(pil_img)
+            self._draw_preview_image(frame_arr)
 
-        self.after(0, draw)
+        try:
+            self.after(0, draw)
+        except Exception:
+            pass
 
-    def _draw_preview_image(self, pil_img: Image.Image) -> None:
-        self._preview_photo = ImageTk.PhotoImage(pil_img)
-        cw = max(10, self.preview_canvas.winfo_width())
-        ch = max(10, self.preview_canvas.winfo_height())
+    def _draw_preview_image(self, img_or_arr: Union[np.ndarray, object]) -> None:
+        self._preview_photo = make_photo_image(img_or_arr)
+        cw = self.preview_canvas.winfo_width()
+        ch = self.preview_canvas.winfo_height()
+        if cw <= 10:
+            cw = int(self.preview_canvas.cget("width") or 420)
+        if ch <= 10:
+            ch = int(self.preview_canvas.cget("height") or 225)
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(
             cw // 2, ch // 2, image=self._preview_photo, anchor="center"
