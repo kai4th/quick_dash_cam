@@ -946,8 +946,8 @@ class QuickDashCamApp(ctk.CTk):
         super().__init__()
 
         self.title("QuickDashCam - 액션캠 주행 영상 시간순 병합 & 스마트 타임라인 편집기")
-        self.geometry("1280x860")
-        self.minsize(1100, 740)
+        self.geometry("1180x760")
+        self.minsize(860, 520)
 
         self.videos: List[VideoFileInfo] = []
         self.selected_index: Optional[int] = None
@@ -1058,54 +1058,54 @@ class QuickDashCamApp(ctk.CTk):
         header.grid_columnconfigure(0, weight=1)
 
         title_box = ctk.CTkFrame(header, fg_color="transparent")
-        title_box.grid(row=0, column=0, sticky="w", padx=20, pady=10)
+        title_box.grid(row=0, column=0, sticky="w", padx=14, pady=6)
 
         ctk.CTkLabel(
             title_box,
             text="🚗 QuickDashCam",
-            font=ctk.CTkFont(size=21, weight="bold"),
-        ).pack(side="left", padx=(0, 14))
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(side="left", padx=(0, 10))
 
         ctk.CTkLabel(
             title_box,
-            text="시간순 자동 병합  |  신호대기·고속도로 직진 스마트 스킵  |  전체 타임라인 탐색 및 구간 잘라내기",
-            font=ctk.CTkFont(size=13),
+            text="시간순 자동 정렬  |  스마트 스킵  |  타임라인 구간 편집",
+            font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
         ).pack(side="left")
 
         self.encoder_badge = ctk.CTkLabel(
             header,
             text="⚡ 인코더 확인 중...",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#1e293b",
             corner_radius=6,
-            padx=10,
-            pady=4,
+            padx=8,
+            pady=3,
         )
-        self.encoder_badge.grid(row=0, column=1, sticky="e", padx=20, pady=10)
+        self.encoder_badge.grid(row=0, column=1, sticky="e", padx=14, pady=6)
 
         # ── 2. 좌측 메인 영역 (상단: 전체 타임라인 탐색 & 잘라내기 편집기 / 하단: 영상 목록) ──
         left_panel = ctk.CTkFrame(self, corner_radius=10)
-        left_panel.grid(row=1, column=0, sticky="nsew", padx=(16, 8), pady=10)
+        left_panel.grid(row=1, column=0, sticky="nsew", padx=(10, 4), pady=(4, 4))
         left_panel.grid_columnconfigure(0, weight=1)
         left_panel.grid_rowconfigure(2, weight=1)
 
         # ── 2-A. 전체 타임라인 미리보기 & 구간 잘라내기 섹션 ──
         editor_frame = ctk.CTkFrame(left_panel, fg_color="#0f172a", corner_radius=8)
-        editor_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        editor_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=3)
         editor_frame.grid_columnconfigure(0, weight=5)
-        editor_frame.grid_columnconfigure(1, weight=4)
+        editor_frame.grid_columnconfigure(1, weight=5)
 
         # 좌측: 비디오 프리뷰 캔버스 (16:9)
         preview_container = ctk.CTkFrame(editor_frame, fg_color="#020617", corner_radius=6)
-        preview_container.grid(row=0, column=0, sticky="nsew", padx=(10, 6), pady=(10, 6))
+        preview_container.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=4)
         preview_container.grid_rowconfigure(0, weight=1)
         preview_container.grid_columnconfigure(0, weight=1)
 
         self.preview_canvas = tk.Canvas(
             preview_container,
-            width=420,
-            height=225,
+            width=340,
+            height=190,
             bg="#020617",
             highlightthickness=0,
             bd=0,
@@ -1115,297 +1115,322 @@ class QuickDashCamApp(ctk.CTk):
 
         # 우측: 타임라인 탐색 컨트롤 & 구간 잘라내기 도구함
         cut_panel = ctk.CTkFrame(editor_frame, fg_color="#1e293b", corner_radius=6)
-        cut_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 10), pady=(10, 6))
+        cut_panel.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=4)
         cut_panel.grid_columnconfigure(0, weight=1)
 
+        # Row 0: 타이틀 + 전체 위치 라벨
+        info_row0 = ctk.CTkFrame(cut_panel, fg_color="transparent")
+        info_row0.grid(row=0, column=0, sticky="ew", padx=8, pady=(4, 1))
+        info_row0.grid_columnconfigure(0, weight=1)
+
         ctk.CTkLabel(
-            cut_panel,
-            text="✂️ 전체 타임라인 탐색 & 특정 구간 잘라내기",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 4))
+            info_row0,
+            text="✂️ 타임라인 탐색 & 구간 편집",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left")
 
         self.playhead_info_label = ctk.CTkLabel(
-            cut_panel,
-            text="전체 위치: 00:00.0 / 00:00.0",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            info_row0,
+            text="전체: 00:00.0 / 00:00.0",
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#38bdf8",
-            anchor="w",
+            anchor="e",
         )
-        self.playhead_info_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 2))
+        self.playhead_info_label.pack(side="right")
+
+        # Row 1: 현재 클립 + 선택 구간 라벨
+        info_row1 = ctk.CTkFrame(cut_panel, fg_color="transparent")
+        info_row1.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 3))
+        info_row1.grid_columnconfigure(0, weight=1)
 
         self.clip_info_label = ctk.CTkLabel(
-            cut_panel,
-            text="현재 클립: 없음",
-            font=ctk.CTkFont(size=12),
+            info_row1,
+            text="클립: 없음",
+            font=ctk.CTkFont(size=11),
             text_color="#cbd5e1",
             anchor="w",
         )
-        self.clip_info_label.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 6))
+        self.clip_info_label.pack(side="left")
 
-        # 재생 및 미세 이동 버튼 줄
+        self.selection_range_label = ctk.CTkLabel(
+            info_row1,
+            text="선택: 미지정",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8",
+            anchor="e",
+        )
+        self.selection_range_label.pack(side="right")
+
+        # Row 2: 재생 및 미세 이동 버튼 줄
         nav_row = ctk.CTkFrame(cut_panel, fg_color="transparent")
-        nav_row.grid(row=3, column=0, sticky="ew", padx=10, pady=(2, 6))
+        nav_row.grid(row=2, column=0, sticky="ew", padx=6, pady=2)
         for col_i in range(6):
             nav_row.grid_columnconfigure(col_i, weight=1)
 
         ctk.CTkButton(
             nav_row,
-            text="⏮ -5초",
-            height=28,
-            width=56,
+            text="⏮ -5s",
+            height=26,
+            width=48,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._step_playhead(-5.0),
-        ).grid(row=0, column=0, padx=2, sticky="ew")
+        ).grid(row=0, column=0, padx=1, sticky="ew")
 
         ctk.CTkButton(
             nav_row,
-            text="◀ -1초",
-            height=28,
-            width=56,
+            text="◀ -1s",
+            height=26,
+            width=48,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._step_playhead(-1.0),
-        ).grid(row=0, column=1, padx=2, sticky="ew")
+        ).grid(row=0, column=1, padx=1, sticky="ew")
 
         self.btn_play_preview = ctk.CTkButton(
             nav_row,
             text="▶ 재생",
-            height=28,
-            width=72,
+            height=26,
+            width=64,
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#0284c7",
             hover_color="#0369a1",
             command=self._toggle_preview_play,
         )
-        self.btn_play_preview.grid(row=0, column=2, padx=2, sticky="ew")
+        self.btn_play_preview.grid(row=0, column=2, padx=1, sticky="ew")
 
         ctk.CTkButton(
             nav_row,
-            text="+1초 ▶",
-            height=28,
-            width=56,
+            text="+1s ▶",
+            height=26,
+            width=48,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._step_playhead(1.0),
-        ).grid(row=0, column=3, padx=2, sticky="ew")
+        ).grid(row=0, column=3, padx=1, sticky="ew")
 
         ctk.CTkButton(
             nav_row,
-            text="+5초 ⏭",
-            height=28,
-            width=56,
+            text="+5s ⏭",
+            height=26,
+            width=48,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._step_playhead(5.0),
-        ).grid(row=0, column=4, padx=2, sticky="ew")
+        ).grid(row=0, column=4, padx=1, sticky="ew")
 
         self.play_rate_var = ctk.StringVar(value="1x")
         ctk.CTkOptionMenu(
             nav_row,
             values=["0.5x", "1x", "2x", "4x", "8x"],
             variable=self.play_rate_var,
-            width=62,
-            height=28,
+            width=54,
+            height=26,
+            font=ctk.CTkFont(size=11),
             command=lambda _v: self._restart_playback_if_playing(),
-        ).grid(row=0, column=5, padx=2, sticky="ew")
+        ).grid(row=0, column=5, padx=1, sticky="ew")
 
-        # 시작점(In) / 끝점(Out) 지정 버튼 줄
+        # Row 3: 시작점(In) / 끝점(Out) 지정 버튼 줄
         inout_row = ctk.CTkFrame(cut_panel, fg_color="transparent")
-        inout_row.grid(row=4, column=0, sticky="ew", padx=10, pady=3)
+        inout_row.grid(row=3, column=0, sticky="ew", padx=6, pady=2)
         inout_row.grid_columnconfigure(0, weight=1)
         inout_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
             inout_row,
-            text="🚩 시작점(In) 찍기 [I]",
-            height=30,
+            text="🚩 시작점(In) [I]",
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#0f766e",
             hover_color="#115e59",
             command=self._on_mark_in,
-        ).grid(row=0, column=0, padx=(2, 4), sticky="ew")
+        ).grid(row=0, column=0, padx=(1, 3), sticky="ew")
 
         ctk.CTkButton(
             inout_row,
-            text="🏁 끝점(Out) 찍기 [O]",
-            height=30,
+            text="🏁 끝점(Out) [O]",
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#0f766e",
             hover_color="#115e59",
             command=self._on_mark_out,
-        ).grid(row=0, column=1, padx=(4, 2), sticky="ew")
+        ).grid(row=0, column=1, padx=(3, 1), sticky="ew")
 
-        self.selection_range_label = ctk.CTkLabel(
-            cut_panel,
-            text="선택 구간: 미지정 (타임라인에서 우클릭 드래그 또는 시작/끝점 버튼 클릭)",
-            font=ctk.CTkFont(size=11),
-            text_color="#94a3b8",
-            anchor="w",
-        )
-        self.selection_range_label.grid(row=5, column=0, sticky="ew", padx=12, pady=(2, 4))
-
-        # 잘라내기 실행 / 복원 / 실행취소 버튼 줄
+        # Row 4: 잘라내기 실행 / 복원 / 되돌리기 버튼 줄
         cut_action_row = ctk.CTkFrame(cut_panel, fg_color="transparent")
-        cut_action_row.grid(row=6, column=0, sticky="ew", padx=10, pady=(2, 8))
+        cut_action_row.grid(row=4, column=0, sticky="ew", padx=6, pady=(2, 5))
         cut_action_row.grid_columnconfigure(0, weight=2)
         cut_action_row.grid_columnconfigure(1, weight=2)
         cut_action_row.grid_columnconfigure(2, weight=1)
 
         ctk.CTkButton(
             cut_action_row,
-            text="✂️ 선택 구간 잘라내기 [Del]",
-            height=32,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="✂️ 선택 잘라내기 [Del]",
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#dc2626",
             hover_color="#b91c1c",
             command=self._on_apply_manual_cut,
-        ).grid(row=0, column=0, padx=2, sticky="ew")
+        ).grid(row=0, column=0, padx=1, sticky="ew")
 
         ctk.CTkButton(
             cut_action_row,
-            text="♻️ 일반 주행(1x) 복원",
-            height=32,
-            font=ctk.CTkFont(size=12),
+            text="♻️ 일반(1x) 복원",
+            height=28,
+            font=ctk.CTkFont(size=11),
             fg_color="#15803d",
             hover_color="#166534",
             command=self._on_restore_selection_normal,
-        ).grid(row=0, column=1, padx=2, sticky="ew")
+        ).grid(row=0, column=1, padx=1, sticky="ew")
 
         self.btn_undo_cut = ctk.CTkButton(
             cut_action_row,
             text="↩ 되돌리기",
-            height=32,
-            width=74,
-            font=ctk.CTkFont(size=12),
+            height=28,
+            width=64,
+            font=ctk.CTkFont(size=11),
             fg_color="#475569",
             hover_color="#334155",
             state="disabled",
             command=self._on_undo_cut,
         )
-        self.btn_undo_cut.grid(row=0, column=2, padx=2, sticky="ew")
+        self.btn_undo_cut.grid(row=0, column=2, padx=1, sticky="ew")
 
         # 하단: 전체 연결 타임라인 캔버스 + 범례
         tl_box = ctk.CTkFrame(editor_frame, fg_color="transparent")
-        tl_box.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(2, 8))
+        tl_box.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=(1, 5))
         tl_box.grid_columnconfigure(0, weight=1)
 
         # 타임라인 확대/축소 컨트롤 줄
         zoom_row = ctk.CTkFrame(tl_box, fg_color="transparent")
-        zoom_row.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        zoom_row.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         for txt, cmd, wdt in [
-            ("🔍＋ 확대", lambda: self.global_timeline.zoom_by(0.5), 74),
-            ("🔍－ 축소", lambda: self.global_timeline.zoom_by(2.0), 74),
-            ("◀ 이동", lambda: self._pan_timeline(-0.5), 60),
-            ("이동 ▶", lambda: self._pan_timeline(0.5), 60),
-            ("⌖ 현재 위치 1분 보기", lambda: self._zoom_around_playhead(60.0), 128),
-            ("⤢ 전체 보기 [0]", lambda: self.global_timeline.zoom_full(), 104),
+            ("🔍+", lambda: self.global_timeline.zoom_by(0.5), 38),
+            ("🔍-", lambda: self.global_timeline.zoom_by(2.0), 38),
+            ("◀", lambda: self._pan_timeline(-0.5), 32),
+            ("▶", lambda: self._pan_timeline(0.5), 32),
+            ("⌖ 1분", lambda: self._zoom_around_playhead(60.0), 56),
+            ("⤢ 전체 [0]", lambda: self.global_timeline.zoom_full(), 72),
         ]:
             ctk.CTkButton(
-                zoom_row, text=txt, width=wdt, height=24, font=ctk.CTkFont(size=11),
+                zoom_row, text=txt, width=wdt, height=22, font=ctk.CTkFont(size=10),
                 fg_color="#334155", hover_color="#475569", command=cmd,
-            ).pack(side="left", padx=(0, 4))
+            ).pack(side="left", padx=(0, 2))
+
         self.view_range_label = ctk.CTkLabel(
             zoom_row,
             text="보기: 전체",
             font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
         )
-        self.view_range_label.pack(side="left", padx=(8, 0))
+        self.view_range_label.pack(side="left", padx=(6, 0))
 
         self.global_timeline = GlobalTimelineCanvas(
             tl_box,
             on_seek=self._on_seek_global_timeline,
             on_range_select=self._on_range_selected_from_timeline,
             on_view_change=self._on_timeline_view_changed,
-            height=76,
+            height=60,
         )
         self.global_timeline.grid(row=1, column=0, sticky="ew")
 
         legend_row = ctk.CTkFrame(tl_box, fg_color="transparent")
-        legend_row.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        legend_row.grid(row=2, column=0, sticky="ew", pady=(2, 0))
 
         for color, text in [
-            (COLOR_NORMAL, "일반 주행 (1x 유지)"),
-            (COLOR_STOP, "신호대기/정차 (배속·스킵)"),
-            (COLOR_STRAIGHT, "고속도로 직진 (배속·스킵)"),
-            (COLOR_MANUAL_CUT, "수동 잘라내기 (완전 삭제)"),
+            (COLOR_NORMAL, "일반(1x)"),
+            (COLOR_STOP, "정차(스킵)"),
+            (COLOR_STRAIGHT, "직진(스킵)"),
+            (COLOR_MANUAL_CUT, "삭제(컷)"),
         ]:
-            dot = ctk.CTkFrame(legend_row, width=11, height=11, fg_color=color, corner_radius=3)
-            dot.pack(side="left", padx=(0, 4))
-            ctk.CTkLabel(legend_row, text=text, font=ctk.CTkFont(size=11)).pack(
-                side="left", padx=(0, 14)
+            dot = ctk.CTkFrame(legend_row, width=9, height=9, fg_color=color, corner_radius=2)
+            dot.pack(side="left", padx=(0, 3))
+            ctk.CTkLabel(legend_row, text=text, font=ctk.CTkFont(size=10)).pack(
+                side="left", padx=(0, 8)
             )
 
         ctk.CTkLabel(
             legend_row,
-            text="💡 휠: 확대/축소 · Shift+휠: 좌우 이동 · 좌클릭: 탐색 · 우클릭 드래그: 구간 지정",
-            font=ctk.CTkFont(size=11),
+            text="💡 휠: 줌 · Shift+휠: 이동 · 우클릭 드래그: 구간 지정",
+            font=ctk.CTkFont(size=10),
             text_color="#38bdf8",
         ).pack(side="right")
 
         # ── 2-B. 파일 추가 및 정렬 툴바 ──
         toolbar = ctk.CTkFrame(left_panel, fg_color="transparent")
-        toolbar.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 4))
+        toolbar.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
 
         self.btn_add_folder = ctk.CTkButton(
             toolbar,
-            text="📁 폴더 통째로 추가",
-            width=136,
-            height=30,
+            text="📁 폴더 추가",
+            width=88,
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#2563eb",
             hover_color="#1d4ed8",
             command=self._on_add_folder,
         )
-        self.btn_add_folder.pack(side="left", padx=(0, 6))
+        self.btn_add_folder.pack(side="left", padx=(0, 4))
 
         self.btn_add_files = ctk.CTkButton(
             toolbar,
-            text="➕ 영상 파일 추가",
-            width=126,
-            height=30,
+            text="➕ 파일 추가",
+            width=84,
+            height=26,
+            font=ctk.CTkFont(size=11),
             command=self._on_add_files,
         )
-        self.btn_add_files.pack(side="left", padx=(0, 10))
+        self.btn_add_files.pack(side="left", padx=(0, 6))
 
-        ctk.CTkLabel(toolbar, text="정렬 기준:", font=ctk.CTkFont(size=12)).pack(
-            side="left", padx=(4, 6)
+        ctk.CTkLabel(toolbar, text="정렬:", font=ctk.CTkFont(size=11)).pack(
+            side="left", padx=(2, 4)
         )
         self.sort_var = ctk.StringVar(value="촬영 시각 순 (권장)")
         self.sort_menu = ctk.CTkOptionMenu(
             toolbar,
             values=["촬영 시각 순 (권장)", "파일 수정일 순", "파일명 순"],
             variable=self.sort_var,
-            width=160,
-            height=28,
+            width=130,
+            height=26,
+            font=ctk.CTkFont(size=11),
             command=lambda _v: self._resort_videos(),
         )
-        self.sort_menu.pack(side="left", padx=(0, 8))
+        self.sort_menu.pack(side="left", padx=(0, 6))
 
         self.btn_clear = ctk.CTkButton(
             toolbar,
             text="전체 비우기",
-            width=82,
-            height=28,
+            width=70,
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#475569",
             hover_color="#334155",
             command=self._on_clear_all,
         )
-        self.btn_clear.pack(side="right", padx=(4, 0))
+        self.btn_clear.pack(side="right", padx=(2, 0))
 
         self.btn_remove = ctk.CTkButton(
             toolbar,
-            text="✕ 클립 제외",
-            width=76,
-            height=28,
+            text="✕ 제외",
+            width=58,
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#dc2626",
             hover_color="#b91c1c",
             command=self._on_remove_selected,
         )
-        self.btn_remove.pack(side="right", padx=4)
+        self.btn_remove.pack(side="right", padx=2)
 
         self.btn_down = ctk.CTkButton(
             toolbar,
             text="▼",
-            width=34,
-            height=28,
+            width=28,
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._move_selected(1),
@@ -1415,8 +1440,9 @@ class QuickDashCamApp(ctk.CTk):
         self.btn_up = ctk.CTkButton(
             toolbar,
             text="▲",
-            width=34,
-            height=28,
+            width=28,
+            height=26,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             command=lambda: self._move_selected(-1),
@@ -1424,8 +1450,8 @@ class QuickDashCamApp(ctk.CTk):
         self.btn_up.pack(side="right", padx=2)
 
         # ── 2-C. 탭: [클립 목록] / [검출 구간 리뷰] ──
-        self.left_tabs = ctk.CTkTabview(left_panel, height=220)
-        self.left_tabs.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 4))
+        self.left_tabs = ctk.CTkTabview(left_panel)
+        self.left_tabs.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 2))
         tab_clips = self.left_tabs.add("📋 클립 목록")
         tab_review = self.left_tabs.add("🔎 검출 구간 리뷰")
         for tab in (tab_clips, tab_review):
@@ -1434,8 +1460,8 @@ class QuickDashCamApp(ctk.CTk):
 
         self.list_scroll = ctk.CTkScrollableFrame(
             tab_clips,
-            label_text="개별 주행 영상 클립 목록 (클립을 클릭하면 해당 위치로 타임라인이 이동합니다)",
-            label_font=ctk.CTkFont(size=12, weight="bold"),
+            label_text="개별 주행 영상 클립 목록 (클릭하여 타임라인 이동)",
+            label_font=ctk.CTkFont(size=11, weight="bold"),
         )
         self.list_scroll.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
         self.list_scroll.grid_columnconfigure(0, weight=1)
@@ -1446,18 +1472,18 @@ class QuickDashCamApp(ctk.CTk):
         self.summary_label = ctk.CTkLabel(
             left_panel,
             text="영상을 추가하면 전체 주행 시간과 예상 단축 시간이 여기에 표시됩니다.",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#1e293b",
             corner_radius=6,
             anchor="w",
-            padx=14,
-            pady=8,
+            padx=10,
+            pady=4,
         )
-        self.summary_label.grid(row=3, column=0, sticky="ew", padx=12, pady=(4, 10))
+        self.summary_label.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 4))
 
         # ── 3. 우측 패널: 자동 감지 및 출력 설정 ──
-        right_panel = ctk.CTkScrollableFrame(self, corner_radius=10, width=350)
-        right_panel.grid(row=1, column=1, sticky="nsew", padx=(8, 16), pady=10)
+        right_panel = ctk.CTkScrollableFrame(self, corner_radius=10, width=300)
+        right_panel.grid(row=1, column=1, sticky="nsew", padx=(4, 10), pady=(4, 4))
         right_panel.grid_columnconfigure(0, weight=1)
 
         # 섹션 A: 건너뛰기 방식
@@ -1688,76 +1714,78 @@ class QuickDashCamApp(ctk.CTk):
         ).grid(row=9, column=0, sticky="w", padx=12, pady=(4, 12))
 
         # ── 4. 하단 실행 및 진행 상태 바 ──
-        bottom_bar = ctk.CTkFrame(self, corner_radius=10, fg_color="#0f172a")
-        bottom_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 12))
+        bottom_bar = ctk.CTkFrame(self, corner_radius=8, fg_color="#0f172a")
+        bottom_bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
         bottom_bar.grid_columnconfigure(0, weight=1)
 
         prog_row = ctk.CTkFrame(bottom_bar, fg_color="transparent")
-        prog_row.grid(row=0, column=0, sticky="ew", padx=16, pady=(8, 4))
+        prog_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(4, 2))
         prog_row.grid_columnconfigure(0, weight=1)
 
         self.status_label = ctk.CTkLabel(
             prog_row,
             text="대기 중 — 주행 영상 파일 또는 폴더를 추가해 주세요.",
-            font=ctk.CTkFont(size=13),
+            font=ctk.CTkFont(size=11),
             anchor="w",
         )
         self.status_label.grid(row=0, column=0, sticky="w")
 
-        self.progress_bar = ctk.CTkProgressBar(prog_row, height=10)
-        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(4, 2))
+        self.progress_bar = ctk.CTkProgressBar(prog_row, height=8)
+        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(2, 2))
         self.progress_bar.set(0.0)
 
         btn_row = ctk.CTkFrame(bottom_bar, fg_color="transparent")
-        btn_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 10))
+        btn_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 6))
+        btn_row.grid_columnconfigure(0, weight=3)
+        btn_row.grid_columnconfigure(1, weight=4)
+        btn_row.grid_columnconfigure(2, weight=1)
+        btn_row.grid_columnconfigure(3, weight=2)
 
         self.btn_analyze = ctk.CTkButton(
             btn_row,
-            text="🔍 자동 구간 분석 (정차·직진 찾기)",
-            height=38,
-            width=230,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            text="🔍 1. 자동 구간 분석",
+            height=32,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#0284c7",
             hover_color="#0369a1",
             command=self._on_start_analysis_only,
         )
-        self.btn_analyze.pack(side="left", padx=(0, 10))
+        self.btn_analyze.grid(row=0, column=0, padx=2, sticky="ew")
 
         self.btn_export = ctk.CTkButton(
             btn_row,
-            text="🎬 주행 영상 하나로 합치기 (MP4 저장)",
-            height=38,
-            width=270,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            text="🎬 2. 영상 합치기 (MP4 저장)",
+            height=32,
+            font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#16a34a",
             hover_color="#15803d",
             command=self._on_start_merge_export,
         )
-        self.btn_export.pack(side="left", padx=(0, 10))
+        self.btn_export.grid(row=0, column=1, padx=2, sticky="ew")
 
         self.btn_cancel = ctk.CTkButton(
             btn_row,
-            text="⏹ 작업 취소",
-            height=38,
-            width=110,
+            text="⏹ 취소",
+            height=32,
+            font=ctk.CTkFont(size=11),
             fg_color="#dc2626",
             hover_color="#b91c1c",
             state="disabled",
             command=self._on_cancel_task,
         )
-        self.btn_cancel.pack(side="left")
+        self.btn_cancel.grid(row=0, column=2, padx=2, sticky="ew")
 
         self.btn_open_folder = ctk.CTkButton(
             btn_row,
-            text="📂 결과 폴더 열기",
-            height=38,
-            width=140,
+            text="📂 결과 폴더",
+            height=32,
+            font=ctk.CTkFont(size=11),
             fg_color="#334155",
             hover_color="#475569",
             state="disabled",
             command=self._on_open_output_folder,
         )
-        self.btn_open_folder.pack(side="right")
+        self.btn_open_folder.grid(row=0, column=3, padx=2, sticky="ew")
 
         self._refresh_video_list_ui()
         self._update_timeline_and_preview()
@@ -1946,7 +1974,7 @@ class QuickDashCamApp(ctk.CTk):
     def _update_selection_label(self) -> None:
         if self.cut_in_sec is None and self.cut_out_sec is None:
             self.selection_range_label.configure(
-                text="선택 구간: 미지정 (타임라인에서 우클릭 드래그 또는 시작/끝점 버튼 클릭)",
+                text="선택: 미지정",
                 text_color="#94a3b8",
             )
             return
@@ -1956,7 +1984,7 @@ class QuickDashCamApp(ctk.CTk):
             s, e = e, s
         dur = max(0.0, e - s)
         self.selection_range_label.configure(
-            text=f"선택 구간: {format_duration(s, True)} ~ {format_duration(e, True)} (길이: {format_duration(dur, True)})",
+            text=f"선택: {format_duration(s, True)}~{format_duration(e, True)} ({format_duration(dur, True)})",
             text_color="#38bdf8",
         )
 
@@ -2041,8 +2069,9 @@ class QuickDashCamApp(ctk.CTk):
         )
 
         if not self.videos or total <= 0:
-            self.playhead_info_label.configure(text="전체 위치: 00:00.0 / 00:00.0")
-            self.clip_info_label.configure(text="현재 클립: 영상을 추가해 주세요")
+            self.playhead_info_label.configure(text="전체: 00:00.0 / 00:00.0")
+            self.clip_info_label.configure(text="클립: 없음")
+            self.selection_range_label.configure(text="선택: 미지정", text_color="#94a3b8")
             self.preview_canvas.delete("all")
             cw = max(100, self.preview_canvas.winfo_width())
             ch = max(80, self.preview_canvas.winfo_height())
@@ -2070,18 +2099,18 @@ class QuickDashCamApp(ctk.CTk):
         clip_idx, video, local_t, seg_type = mapped
         total = self.total_timeline_duration
 
-        seg_badge = {
-            SegmentType.NORMAL: "🟢 일반 주행 (1x)",
-            SegmentType.STOP: "🟠 신호대기/정차 (건너뛰기)",
-            SegmentType.STRAIGHT: "🟣 고속도로 직진 (건너뛰기)",
-            SegmentType.MANUAL_CUT: "🔴 수동 잘라내기 (삭제됨)",
-        }.get(seg_type, "🟢 일반 주행")
+        seg_short = {
+            SegmentType.NORMAL: "1x",
+            SegmentType.STOP: "정차",
+            SegmentType.STRAIGHT: "직진",
+            SegmentType.MANUAL_CUT: "삭제",
+        }.get(seg_type, "1x")
 
         self.playhead_info_label.configure(
-            text=f"전체 위치: {format_duration(self.playhead_sec, True)} / {format_duration(total, True)}   [{seg_badge}]"
+            text=f"전체: {format_duration(self.playhead_sec, True)} / {format_duration(total, True)} [{seg_short}]"
         )
         self.clip_info_label.configure(
-            text=f"현재 클립: [#{clip_idx + 1}] {video.filename} (클립 내 위치 {format_duration(local_t, True)})"
+            text=f"클립: [#{clip_idx + 1}] {video.filename[:22]}"
         )
 
     def _request_current_preview_frame(self) -> None:
@@ -2111,9 +2140,9 @@ class QuickDashCamApp(ctk.CTk):
         cw = self.preview_canvas.winfo_width()
         ch = self.preview_canvas.winfo_height()
         if cw <= 10:
-            cw = int(self.preview_canvas.cget("width") or 420)
+            cw = int(self.preview_canvas.cget("width") or 340)
         if ch <= 10:
-            ch = int(self.preview_canvas.cget("height") or 225)
+            ch = int(self.preview_canvas.cget("height") or 190)
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(
             cw // 2, ch // 2, image=self._preview_photo, anchor="center"
@@ -2167,11 +2196,11 @@ class QuickDashCamApp(ctk.CTk):
         parent.grid_rowconfigure(2, weight=1)
 
         head = ctk.CTkFrame(parent, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew")
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 2))
         self.review_progress_label = ctk.CTkLabel(
             head,
-            text="자동 구간 분석을 실행하면 검출된 신호대기·단조 주행 구간이 여기에 나열됩니다.",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            text="검출 구간 목록 (클릭하여 확인 및 결정)",
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#cbd5e1",
         )
         self.review_progress_label.pack(side="left")
@@ -2181,73 +2210,75 @@ class QuickDashCamApp(ctk.CTk):
             head,
             values=["전체 보기", "미검토만", "신호대기만", "단조 주행만"],
             variable=self.review_filter_var,
-            width=110,
-            height=26,
+            width=96,
+            height=24,
+            font=ctk.CTkFont(size=11),
             command=lambda _v: self._refresh_review_ui(),
-        ).pack(side="right", padx=(6, 0))
+        ).pack(side="right", padx=(4, 0))
         self.review_autoplay_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             head,
             text="선택 시 자동 재생",
             variable=self.review_autoplay_var,
-            font=ctk.CTkFont(size=11),
-            checkbox_width=18,
-            checkbox_height=18,
-        ).pack(side="right", padx=(6, 0))
+            font=ctk.CTkFont(size=10),
+            checkbox_width=16,
+            checkbox_height=16,
+        ).pack(side="right", padx=(4, 0))
         ctk.CTkButton(
             head,
             text="▶ 리뷰 시작",
-            width=92,
-            height=26,
+            width=78,
+            height=24,
+            font=ctk.CTkFont(size=11),
             fg_color="#0284c7",
             hover_color="#0369a1",
             command=self._review_start,
-        ).pack(side="right", padx=(6, 0))
+        ).pack(side="right", padx=(4, 0))
 
         card = ctk.CTkFrame(parent, fg_color="#0f172a", corner_radius=6)
-        card.grid(row=1, column=0, sticky="ew", pady=(4, 4))
+        card.grid(row=1, column=0, sticky="ew", pady=(2, 2))
         card.grid_columnconfigure(0, weight=1)
 
         self.review_current_label = ctk.CTkLabel(
             card,
             text="현재 검토 구간: 없음",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#facc15",
             anchor="w",
         )
-        self.review_current_label.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
+        self.review_current_label.grid(row=0, column=0, sticky="ew", padx=8, pady=(3, 1))
 
         btn_row1 = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row1.grid(row=1, column=0, sticky="ew", padx=6, pady=2)
+        btn_row1.grid(row=1, column=0, sticky="ew", padx=4, pady=1)
         row1_specs = [
-            ("◀ 이전 [P]", lambda: self._review_step(-1), "#334155", "#475569"),
-            ("▶ 구간 재생 [R]", self._review_play_current, "#0284c7", "#0369a1"),
-            ("✔ 스킵 유지 [1]", lambda: self._review_decide("keep"), "#b45309", "#92400e"),
-            ("♻ 일반 주행 복원 [2]", lambda: self._review_decide("normal"), "#15803d", "#166534"),
-            ("✂ 완전 삭제 [3]", lambda: self._review_decide("cut"), "#dc2626", "#b91c1c"),
-            ("다음 ▶ [N]", lambda: self._review_step(1), "#334155", "#475569"),
+            ("◀ [P]", lambda: self._review_step(-1), "#334155", "#475569"),
+            ("▶ 재생 [R]", self._review_play_current, "#0284c7", "#0369a1"),
+            ("✔ 스킵 [1]", lambda: self._review_decide("keep"), "#b45309", "#92400e"),
+            ("♻ 일반 [2]", lambda: self._review_decide("normal"), "#15803d", "#166534"),
+            ("✂ 삭제 [3]", lambda: self._review_decide("cut"), "#dc2626", "#b91c1c"),
+            ("[N] ▶", lambda: self._review_step(1), "#334155", "#475569"),
         ]
         for col_i, (txt, cmd, fg, hv) in enumerate(row1_specs):
             btn_row1.grid_columnconfigure(col_i, weight=1)
             ctk.CTkButton(
-                btn_row1, text=txt, height=28, font=ctk.CTkFont(size=12, weight="bold"),
+                btn_row1, text=txt, height=24, font=ctk.CTkFont(size=11, weight="bold"),
                 fg_color=fg, hover_color=hv, command=cmd,
-            ).grid(row=0, column=col_i, padx=2, sticky="ew")
+            ).grid(row=0, column=col_i, padx=1, sticky="ew")
 
         btn_row2 = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row2.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
+        btn_row2.grid(row=2, column=0, sticky="ew", padx=4, pady=(1, 3))
         row2_specs = [
-            ("⇤ 현재 위치를 시작점으로 [ [ ]", lambda: self._review_set_boundary("start")),
-            ("현재 위치를 끝점으로 ⇥ [ ] ]", lambda: self._review_set_boundary("end")),
-            ("남은 미검토 모두 스킵 유지", self._review_keep_all_pending),
+            ("⇤ 시작점 [ [ ]", lambda: self._review_set_boundary("start")),
+            ("끝점 ⇥ [ ] ]", lambda: self._review_set_boundary("end")),
+            ("미검토 모두 스킵 유지", self._review_keep_all_pending),
         ]
         for col_i, (txt, cmd) in enumerate(row2_specs):
             btn_row2.grid_columnconfigure(col_i, weight=1)
             ctk.CTkButton(
-                btn_row2, text=txt, height=26, font=ctk.CTkFont(size=11),
+                btn_row2, text=txt, height=22, font=ctk.CTkFont(size=10),
                 fg_color="#1e293b", hover_color="#334155", border_width=1,
                 border_color="#475569", command=cmd,
-            ).grid(row=0, column=col_i, padx=2, sticky="ew")
+            ).grid(row=0, column=col_i, padx=1, sticky="ew")
 
         tree_box = ctk.CTkFrame(parent, fg_color="#1e293b", corner_radius=6)
         tree_box.grid(row=2, column=0, sticky="nsew")
@@ -2264,7 +2295,7 @@ class QuickDashCamApp(ctk.CTk):
             background="#1e293b",
             fieldbackground="#1e293b",
             foreground="#e2e8f0",
-            rowheight=22,
+            rowheight=20,
             borderwidth=0,
             font=("Malgun Gothic", 9),
         )
@@ -2280,17 +2311,17 @@ class QuickDashCamApp(ctk.CTk):
 
         columns = ("no", "type", "start", "end", "dur", "clip", "status")
         self.review_tree = ttk.Treeview(
-            tree_box, columns=columns, show="headings", height=5,
+            tree_box, columns=columns, show="headings", height=4,
             style="Review.Treeview", selectmode="browse",
         )
         for col, txt, wdt, anchor in [
-            ("no", "No", 44, "center"),
-            ("type", "유형", 100, "w"),
-            ("start", "시작", 84, "center"),
-            ("end", "끝", 84, "center"),
-            ("dur", "길이", 70, "e"),
-            ("clip", "클립", 50, "center"),
-            ("status", "결정", 100, "w"),
+            ("no", "No", 34, "center"),
+            ("type", "유형", 78, "w"),
+            ("start", "시작", 64, "center"),
+            ("end", "끝", 64, "center"),
+            ("dur", "길이", 54, "e"),
+            ("clip", "클립", 44, "center"),
+            ("status", "결정", 78, "w"),
         ]:
             self.review_tree.heading(col, text=txt)
             self.review_tree.column(col, width=wdt, anchor=anchor, stretch=(col == "status"))
