@@ -2242,7 +2242,7 @@ class QuickDashCamApp(ctk.CTk):
         self.review_current_label = ctk.CTkLabel(
             card,
             text="현재 검토 구간: 없음",
-            font=ctk.CTkFont(size=11, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#facc15",
             anchor="w",
         )
@@ -2275,7 +2275,7 @@ class QuickDashCamApp(ctk.CTk):
         for col_i, (txt, cmd) in enumerate(row2_specs):
             btn_row2.grid_columnconfigure(col_i, weight=1)
             ctk.CTkButton(
-                btn_row2, text=txt, height=22, font=ctk.CTkFont(size=10),
+                btn_row2, text=txt, height=24, font=ctk.CTkFont(size=11),
                 fg_color="#1e293b", hover_color="#334155", border_width=1,
                 border_color="#475569", command=cmd,
             ).grid(row=0, column=col_i, padx=1, sticky="ew")
@@ -2284,6 +2284,12 @@ class QuickDashCamApp(ctk.CTk):
         tree_box.grid(row=2, column=0, sticky="nsew")
         tree_box.grid_columnconfigure(0, weight=1)
         tree_box.grid_rowconfigure(0, weight=1)
+
+        scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        body_px = int(round(-12 * scaling))
+        head_px = int(round(-12 * scaling))
+        row_height = max(24, int(round(24 * scaling)))
+        head_pad_y = max(3, int(round(4 * scaling)))
 
         style = ttk.Style(self)
         try:
@@ -2295,16 +2301,17 @@ class QuickDashCamApp(ctk.CTk):
             background="#1e293b",
             fieldbackground="#1e293b",
             foreground="#e2e8f0",
-            rowheight=20,
+            rowheight=row_height,
             borderwidth=0,
-            font=("Malgun Gothic", 9),
+            font=("Malgun Gothic", body_px),
         )
         style.configure(
             "Review.Treeview.Heading",
             background="#334155",
             foreground="#e2e8f0",
             relief="flat",
-            font=("Malgun Gothic", 9, "bold"),
+            padding=(0, head_pad_y),
+            font=("Malgun Gothic", head_px, "bold"),
         )
         style.map("Review.Treeview", background=[("selected", "#0369a1")], foreground=[("selected", "#ffffff")])
         style.map("Review.Treeview.Heading", background=[("active", "#475569")])
@@ -2314,17 +2321,18 @@ class QuickDashCamApp(ctk.CTk):
             tree_box, columns=columns, show="headings", height=4,
             style="Review.Treeview", selectmode="browse",
         )
-        for col, txt, wdt, anchor in [
-            ("no", "No", 34, "center"),
-            ("type", "유형", 78, "w"),
-            ("start", "시작", 64, "center"),
-            ("end", "끝", 64, "center"),
-            ("dur", "길이", 54, "e"),
-            ("clip", "클립", 44, "center"),
-            ("status", "결정", 78, "w"),
+        for col, txt, base_wdt, anchor in [
+            ("no", "No", 44, "center"),
+            ("type", "유형", 85, "w"),
+            ("start", "시작", 75, "center"),
+            ("end", "끝", 75, "center"),
+            ("dur", "길이", 62, "e"),
+            ("clip", "클립", 48, "center"),
+            ("status", "결정", 96, "w"),
         ]:
+            scaled_wdt = int(round(base_wdt * scaling))
             self.review_tree.heading(col, text=txt)
-            self.review_tree.column(col, width=wdt, anchor=anchor, stretch=(col == "status"))
+            self.review_tree.column(col, width=scaled_wdt, anchor=anchor, stretch=(col == "status"))
         self.review_tree.tag_configure("pending", foreground="#fbbf24")
         self.review_tree.tag_configure("keep", foreground="#fdba74")
         self.review_tree.tag_configure("normal", foreground="#4ade80")
