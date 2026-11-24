@@ -19,7 +19,11 @@ from src.models import (
     AnalysisConfig,
     AudioMode,
     ExportConfig,
+    HighlightConfig,
     SegmentType,
+    ShortsAudioMode,
+    ShortsExportConfig,
+    ShortsLayout,
     SkipMode,
     SortMode,
     VideoCodec,
@@ -29,6 +33,7 @@ from src.models import (
     map_global_time_to_clip,
     merge_preserving_manual_cuts,
 )
+from src.highlights import render_highlight_shorts, select_highlights
 from src.processor import render_merged_video
 from src.sorter import sort_video_files
 
@@ -282,7 +287,99 @@ def test_analysis_and_export() -> None:
         print("[PASS] Global timeline scrubbing, manual cut, HEVC & near-lossless export verified!")
 
 
+def test_highlight_shorts() -> None:
+    with tempfile.TemporaryDirectory(prefix="qdc_shorts_") as tmp:
+        tmp_dir = Path(tmp)
+        clip1 = tmp_dir / "VID_20261024_090000.mp4"
+        clip2 = tmp_dir / "VID_20261024_091000.mp4"
+        _create_synthetic_driving_video(clip1, duration_sec=32, fps=20)
+        clip2.write_bytes(clip1.read_bytes())
+
+        info1 = probe_video_file(clip1)
+        info2 = probe_video_file(clip2)
+        cfg = AnalysisConfig(sensitivity=0.5, min_skip_duration_sec=5.0, transition_padding_sec=0.5)
+        for info in (info1, info2):
+            info.segments = analyze_video(info, cfg)
+            info.analyzed = True
+
+        # 1) 하이라이트 선정: 정차(STOP) 구간은 절대 포함되지 않고, 회전·시내 주행 구간이 우선 선택되어야 함
+        hcfg = HighlightConfig(target_duration_sec=8.0, clip_duration_sec=2.0)
+        clips = select_highlights([info1, info2], hcfg)
+        print("Highlights:", [(c.video.filename, round(c.start_sec, 1), round(c.end_sec, 1), c.reason) for c in clips])
+        assert clips, "Expected at least one highlight clip"
+        total = sum(c.duration for c in clips)
+        assert 6.0 <= total <= 9.0, f"Unexpected highlight total duration: {total}"
+        for c in clips:
+            for seg in c.video.segments:
+                if seg.segment_type == SegmentType.STOP:
+                    ov = min(c.end_sec, seg.end_sec) - max(c.start_sec, seg.start_sec)
+                    assert ov <= 0.3, f"Highlight overlaps traffic-light stop: {c} vs {seg}"
+        in_normal = sum(
+            max(0.0, min(c.end_sec, 23.5) - max(c.start_sec, 14.5)) for c in clips
+        )
+        assert in_normal >= total * 0.5, f"Expected highlights mostly from turning/city driving: {in_normal}/{total}"
+        ordered = [(0 if c.video is info1 else 1, c.start_sec) for c in clips]
+        assert ordered == sorted(ordered), "Highlights must be in chronological order"
+        print("[PASS] Highlight selection (skips stops, prefers turns/city driving, chronological) verified!")
+
+        # 2) 수동 잘라내기 구간은 하이라이트에서 제외되어야 함
+        apply_global_timeline_override([info1, info2], 14.0, 24.0, SegmentType.MANUAL_CUT)
+        clips_cut = select_highlights([info1, info2], hcfg)
+        for c in clips_cut:
+            if c.video is info1:
+                ov = min(c.end_sec, 24.0) - max(c.start_sec, 14.0)
+                assert ov <= 0.3, f"Highlight overlaps manual cut: {c}"
+        print("[PASS] Manual cuts excluded from highlights:", [(round(c.start_sec, 1), c.reason) for c in clips_cut])
+
+        # 3) 세로 9:16 흐림 배경 + 한글 제목 + 촬영 시각 + 원본 소리
+        out_v = tmp_dir / "shorts_vertical.mp4"
+        render_highlight_shorts(
+            clips,
+            ShortsExportConfig(
+                output_path=out_v,
+                layout=ShortsLayout.VERTICAL_BLUR,
+                title_text="2026.10.24 주행 하이라이트",
+                show_timestamp=True,
+                audio_mode=ShortsAudioMode.ORIGINAL,
+            ),
+        )
+        pv = probe_video_file(out_v)
+        print(f"Vertical shorts: {pv.width}x{pv.height}, {pv.duration_sec:.2f}s, audio={pv.has_audio}")
+        assert (pv.width, pv.height) == (1080, 1920), f"Unexpected shorts size: {pv.width}x{pv.height}"
+        assert abs(pv.duration_sec - total) < 1.0, f"Unexpected shorts duration: {pv.duration_sec} vs {total}"
+        assert pv.has_audio, "Expected audio in vertical shorts"
+        print("[PASS] Vertical 9:16 shorts (blur background, title, timestamp) verified!")
+
+        # 4) 장면 하나 제외 + 720p 꽉 채우기 + 원본 소리와 배경음악 믹스
+        bgm = tmp_dir / "bgm.m4a"
+        subprocess.run(
+            [get_ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-t", "3",
+             "-i", "sine=frequency=660:sample_rate=48000", "-c:a", "aac", str(bgm)],
+            check=True, creationflags=get_CreationFlags(),
+        )
+        clips[0].included = False
+        kept = sum(c.duration for c in clips if c.included)
+        out_b = tmp_dir / "shorts_bgm.mp4"
+        render_highlight_shorts(
+            clips,
+            ShortsExportConfig(
+                output_path=out_b,
+                layout=ShortsLayout.VERTICAL_CROP,
+                resolution="720p",
+                audio_mode=ShortsAudioMode.BGM_MIX,
+                bgm_path=bgm,
+            ),
+        )
+        pb = probe_video_file(out_b)
+        print(f"BGM shorts: {pb.width}x{pb.height}, {pb.duration_sec:.2f}s (expected {kept:.2f}s), audio={pb.has_audio}")
+        assert (pb.width, pb.height) == (720, 1280)
+        assert abs(pb.duration_sec - kept) < 1.0, "Excluded clip should shorten shorts; BGM loops to full length"
+        assert pb.has_audio
+        print("[PASS] Excluded clip, 720p crop layout & looping BGM mix verified!")
+
+
 if __name__ == "__main__":
     test_sorter()
     test_analysis_and_export()
+    test_highlight_shorts()
     print("ALL TESTS PASSED SUCCESSFULLY!")

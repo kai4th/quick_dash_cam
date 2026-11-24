@@ -288,3 +288,55 @@ class ExportConfig:
     video_codec: VideoCodec = VideoCodec.H264
     overlay_speed_badge: bool = False     # 배속 구간 우측 상단에 '>> 8x' 배지 표시 여부
     use_hw_accel: bool = True             # 가능한 경우 GPU 하드웨어 인코더 사용
+
+
+class ShortsLayout(str, Enum):
+    VERTICAL_BLUR = "vertical_blur"  # 세로 9:16 — 원본 가로 영상 전체를 중앙에 두고 위/아래는 흐림 배경으로 채움
+    VERTICAL_CROP = "vertical_crop"  # 세로 9:16 — 화면 중앙을 꽉 차게 잘라냄 (좌우가 잘림)
+    LANDSCAPE = "landscape"          # 가로 16:9 — 원본 비율 유지
+
+
+class ShortsAudioMode(str, Enum):
+    ORIGINAL = "original"  # 원본 주행 소리
+    BGM = "bgm"            # 배경음악으로 교체
+    BGM_MIX = "bgm_mix"    # 원본 소리 + 배경음악 함께
+    MUTE = "mute"          # 무음
+
+
+@dataclass
+class HighlightClip:
+    """하이라이트 쇼츠에 들어갈 장면 하나 (클립 로컬 시간 기준)."""
+    video: VideoFileInfo
+    start_sec: float
+    end_sec: float
+    score: float = 0.0
+    reason: str = ""        # 선정 이유 (예: "회전·커브", "돌발 장면")
+    included: bool = True   # 사용자가 목록에서 제외하면 False
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_sec - self.start_sec)
+
+
+@dataclass
+class HighlightConfig:
+    target_duration_sec: float = 30.0     # 완성 쇼츠 목표 길이
+    clip_duration_sec: float = 3.0        # 장면 하나당 길이
+    use_audio_peaks: bool = True          # 경적·큰 소리 등 오디오 이벤트도 하이라이트 점수에 반영
+    straight_weight: float = 0.35         # 고속도로 직진 구간의 점수 가중치 (0 = 제외)
+
+
+@dataclass
+class ShortsExportConfig:
+    output_path: Path
+    layout: ShortsLayout = ShortsLayout.VERTICAL_BLUR
+    resolution: str = "1080p"             # "1080p" (1080x1920) / "720p" (720x1280)
+    fps: float = 30.0
+    audio_mode: ShortsAudioMode = ShortsAudioMode.ORIGINAL
+    bgm_path: Optional[Path] = None
+    bgm_volume: float = 0.6
+    fade_sec: float = 0.25                # 장면 전환 페이드 길이
+    title_text: str = ""                  # 화면 상단 제목 (빈 문자열이면 표시 안 함)
+    show_timestamp: bool = True           # 장면별 촬영 시각 표시
+    quality_preset: VideoQualityPreset = VideoQualityPreset.HIGH
+    use_hw_accel: bool = True

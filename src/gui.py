@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from .analyzer import analyze_video, reclassify_from_cache
+from .highlights import ensure_audio_levels, render_highlight_shorts, select_highlights
 from .ffmpeg_utils import (
     VIDEO_EXTENSIONS,
     detect_best_gpu_decoder,
@@ -30,8 +31,13 @@ from .models import (
     AnalysisConfig,
     AudioMode,
     ExportConfig,
+    HighlightClip,
+    HighlightConfig,
     Segment,
     SegmentType,
+    ShortsAudioMode,
+    ShortsExportConfig,
+    ShortsLayout,
     SkipMode,
     SortMode,
     VideoCodec,
@@ -53,6 +59,11 @@ COLOR_STOP = "#f59e0b"        # 주황: 신호대기 / 정차
 COLOR_STRAIGHT = "#a855f7"    # 보라: 장시간 고속도로 직진
 COLOR_MANUAL_CUT = "#ef4444"  # 빨강: 수동 잘라내기 (삭제 구간)
 COLOR_UNANALYZED = "#475569"
+COLOR_HIGHLIGHT = "#22d3ee"   # 하늘색: 하이라이트 쇼츠 장면
+
+TAB_CLIPS = "📋 클립 목록"
+TAB_REVIEW = "🔎 검출 구간 리뷰"
+TAB_SHORTS = "🎬 하이라이트 쇼츠"
 
 
 def format_duration(seconds: float, include_tenths: bool = False) -> str:
@@ -504,6 +515,7 @@ class GlobalTimelineCanvas(tk.Canvas):
         self._view_start: float = 0.0
         self._view_end: Optional[float] = None  # None = 전체 보기
         self._highlight: Optional[Tuple[float, float]] = None
+        self._marks: List[Tuple[float, float]] = []
         self._pan_anchor: Optional[Tuple[int, float, float]] = None
 
         self.bind("<Configure>", lambda _e: self.redraw())
@@ -539,6 +551,11 @@ class GlobalTimelineCanvas(tk.Canvas):
 
     def set_highlight(self, rng: Optional[Tuple[float, float]]) -> None:
         self._highlight = rng
+        self.redraw()
+
+    def set_marks(self, ranges: List[Tuple[float, float]]) -> None:
+        """하이라이트 쇼츠 장면 위치를 타임라인 바 위쪽에 하늘색 표식으로 표시합니다."""
+        self._marks = list(ranges)
         self.redraw()
 
     @property
@@ -882,6 +899,18 @@ class GlobalTimelineCanvas(tk.Canvas):
                     font=("Consolas", 8, "bold"),
                 )
 
+        # 2-A. 하이라이트 쇼츠 장면 표식 (바 상단 하늘색 띠 + 미니맵 점)
+        for ms, me in self._marks:
+            mx1 = self._mini_x(ms)
+            self.create_rectangle(
+                mx1, self.MINI_Y1, max(mx1 + 2, self._mini_x(me)), self.MINI_Y2, fill=COLOR_HIGHLIGHT, outline=""
+            )
+            if me < vs or ms > ve:
+                continue
+            hx1 = max(-2.0, self._sec_to_x(ms))
+            hx2 = min(w + 2.0, max(hx1 + 3, self._sec_to_x(me)))
+            self.create_rectangle(hx1, bar_y1, hx2, bar_y1 + 6, fill=COLOR_HIGHLIGHT, outline="#0e7490")
+
         # 2-B. 현재 리뷰 중인 구간 강조 (노란 테두리)
         if self._highlight is not None:
             hs, he = self._highlight
@@ -976,6 +1005,12 @@ class QuickDashCamApp(ctk.CTk):
         self.review_index: Optional[int] = None
         self._suppress_tree_select: bool = False
 
+        # 하이라이트 쇼츠 상태
+        self.highlight_clips: List[HighlightClip] = []
+        self.highlight_index: Optional[int] = None
+        self.shorts_bgm_path: Optional[Path] = None
+        self._hl_play_queue: List[int] = []
+
         self._preview_worker = PreviewFrameWorker(self._on_worker_frame_ready)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1017,6 +1052,9 @@ class QuickDashCamApp(ctk.CTk):
             self.bind(key, lambda _e: self._review_play_current())
         self.bind("<bracketleft>", lambda _e: self._review_set_boundary("start"))
         self.bind("<bracketright>", lambda _e: self._review_set_boundary("end"))
+        # 하이라이트 쇼츠: 선택 장면 포함/제외
+        for key in ("x", "X"):
+            self.bind(key, lambda _e: self._shorts_toggle_selected())
 
     def _detect_encoder_async(self) -> None:
         def worker():
@@ -1452,9 +1490,10 @@ class QuickDashCamApp(ctk.CTk):
         # ── 2-C. 탭: [클립 목록] / [검출 구간 리뷰] ──
         self.left_tabs = ctk.CTkTabview(left_panel)
         self.left_tabs.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 2))
-        tab_clips = self.left_tabs.add("📋 클립 목록")
-        tab_review = self.left_tabs.add("🔎 검출 구간 리뷰")
-        for tab in (tab_clips, tab_review):
+        tab_clips = self.left_tabs.add(TAB_CLIPS)
+        tab_review = self.left_tabs.add(TAB_REVIEW)
+        tab_shorts = self.left_tabs.add(TAB_SHORTS)
+        for tab in (tab_clips, tab_review, tab_shorts):
             tab.grid_columnconfigure(0, weight=1)
         tab_clips.grid_rowconfigure(0, weight=1)
 
@@ -1467,6 +1506,7 @@ class QuickDashCamApp(ctk.CTk):
         self.list_scroll.grid_columnconfigure(0, weight=1)
 
         self._build_review_tab(tab_review)
+        self._build_shorts_tab(tab_shorts)
 
         # ── 2-D. 하단 요약 통계 바 ──
         self.summary_label = ctk.CTkLabel(
@@ -1801,6 +1841,7 @@ class QuickDashCamApp(ctk.CTk):
             return
         total = self.total_timeline_duration
         self.playhead_sec = max(0.0, min(total, target_sec))
+        self._hl_play_queue = []
         if self.is_playing_preview:
             # 재생 중 탐색: 디코더를 잠시 멈추고 탐색이 끝나면(0.25초 후) 새 위치에서 이어서 재생
             self._playback.stop()
@@ -1882,6 +1923,7 @@ class QuickDashCamApp(ctk.CTk):
             self._schedule_playback_restart()
 
     def _stop_preview_play(self) -> None:
+        self._hl_play_queue = []
         if self.is_playing_preview:
             self.is_playing_preview = False
             self._playback.stop()
@@ -1909,6 +1951,11 @@ class QuickDashCamApp(ctk.CTk):
                     self._last_label_update = now
                     self._update_playhead_labels()
         if self._playback.is_finished(self._play_session) and self._play_restart_job is None:
+            if self._hl_play_queue:
+                # 하이라이트 전체 미리보기: 다음 장면으로 바로 이어서 재생
+                self._shorts_play_next_in_queue()
+                self.after(12, self._playback_poll)
+                return
             if self._play_stop_at is not None:
                 self.playhead_sec = min(self._play_stop_at, self.total_timeline_duration)
             elif self.playhead_sec >= self.total_timeline_duration - 0.5:
@@ -2548,7 +2595,7 @@ class QuickDashCamApp(ctk.CTk):
         return indices[0]
 
     def _review_start(self) -> None:
-        self.left_tabs.set("🔎 검출 구간 리뷰")
+        self.left_tabs.set(TAB_REVIEW)
         if not self.review_items:
             messagebox.showinfo(
                 "리뷰할 구간 없음",
@@ -2658,6 +2705,497 @@ class QuickDashCamApp(ctk.CTk):
         self._refresh_video_list_ui()
         self._update_timeline_and_preview()
         self.status_label.configure(text=f"✔ 미검토 구간 {len(pending)}개를 모두 스킵 유지로 확정했습니다.")
+
+    # ── 하이라이트 쇼츠 탭 ──
+
+    def _build_shorts_tab(self, parent) -> None:
+        parent.grid_rowconfigure(2, weight=1)
+        small = ctk.CTkFont(size=11)
+
+        opts = ctk.CTkFrame(parent, fg_color="#0f172a", corner_radius=6)
+        opts.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+
+        row1 = ctk.CTkFrame(opts, fg_color="transparent")
+        row1.pack(fill="x", padx=6, pady=(4, 1))
+        ctk.CTkLabel(row1, text="길이", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_len_var = ctk.StringVar(value="30초 (권장)")
+        ctk.CTkOptionMenu(
+            row1, values=["15초", "30초 (권장)", "45초", "60초", "90초"], variable=self.shorts_len_var,
+            width=92, height=24, font=small, command=lambda _v: self._shorts_settings_changed(),
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row1, text="장면당", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_clip_var = ctk.StringVar(value="3초 (권장)")
+        ctk.CTkOptionMenu(
+            row1, values=["2초", "3초 (권장)", "4초", "5초"], variable=self.shorts_clip_var,
+            width=88, height=24, font=small, command=lambda _v: self._shorts_settings_changed(),
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row1, text="화면", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_layout_var = ctk.StringVar(value="세로 9:16 · 흐림 배경 (권장)")
+        ctk.CTkOptionMenu(
+            row1, values=["세로 9:16 · 흐림 배경 (권장)", "세로 9:16 · 꽉 채우기", "가로 16:9"],
+            variable=self.shorts_layout_var, width=168, height=24, font=small,
+        ).pack(side="left", padx=(0, 8))
+        self.shorts_res_var = ctk.StringVar(value="1080p")
+        ctk.CTkOptionMenu(
+            row1, values=["1080p", "720p"], variable=self.shorts_res_var, width=66, height=24, font=small,
+        ).pack(side="left")
+
+        row2 = ctk.CTkFrame(opts, fg_color="transparent")
+        row2.pack(fill="x", padx=6, pady=1)
+        ctk.CTkLabel(row2, text="소리", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_audio_var = ctk.StringVar(value="원본 주행 소리")
+        ctk.CTkOptionMenu(
+            row2, values=["원본 주행 소리", "배경음악만", "원본 + 배경음악", "무음"],
+            variable=self.shorts_audio_var, width=118, height=24, font=small,
+        ).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(
+            row2, text="🎵 음악 선택", width=78, height=24, font=small,
+            fg_color="#334155", hover_color="#475569", command=self._shorts_pick_bgm,
+        ).pack(side="left", padx=(0, 4))
+        self.shorts_bgm_label = ctk.CTkLabel(row2, text="(배경음악 없음)", font=small, text_color="#94a3b8")
+        self.shorts_bgm_label.pack(side="left", padx=(0, 8))
+        self.shorts_audio_peak_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row2, text="경적·큰 소리 반영", variable=self.shorts_audio_peak_var, font=ctk.CTkFont(size=10),
+            checkbox_width=16, checkbox_height=16, command=self._shorts_settings_changed,
+        ).pack(side="right", padx=(4, 0))
+        self.shorts_ts_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row2, text="촬영 시각 표시", variable=self.shorts_ts_var, font=ctk.CTkFont(size=10),
+            checkbox_width=16, checkbox_height=16,
+        ).pack(side="right", padx=(4, 0))
+
+        row3 = ctk.CTkFrame(opts, fg_color="transparent")
+        row3.pack(fill="x", padx=6, pady=(1, 4))
+        ctk.CTkLabel(row3, text="제목", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_title_entry = ctk.CTkEntry(
+            row3, height=24, font=small,
+            placeholder_text="화면 상단에 넣을 제목 (예: 출근길 하이라이트) — 비워두면 표시 안 함",
+        )
+        self.shorts_title_entry.pack(side="left", fill="x", expand=True)
+        # 제목 입력 중에는 Space/Delete/숫자 등 전역 단축키가 동작하지 않도록 최상위 창 바인딩 제외
+        inner = getattr(self.shorts_title_entry, "_entry", None)
+        if inner is not None:
+            top_tag = str(inner.winfo_toplevel())
+            inner.bindtags(tuple(t for t in inner.bindtags() if t != top_tag))
+
+        actions = ctk.CTkFrame(parent, fg_color="transparent")
+        actions.grid(row=1, column=0, sticky="ew", pady=(1, 2))
+        action_specs = [
+            ("✨ 하이라이트 찾기", self._on_find_highlights, "#7c3aed", "#6d28d9", 3),
+            ("▶ 전체 미리보기", self._shorts_preview_all, "#0284c7", "#0369a1", 2),
+            ("⊘ 포함/제외 [X]", self._shorts_toggle_selected, "#334155", "#475569", 2),
+            ("🎬 쇼츠 만들기 (MP4)", self._on_make_shorts, "#db2777", "#be185d", 3),
+        ]
+        for col_i, (txt, cmd, fg, hv, wt) in enumerate(action_specs):
+            actions.grid_columnconfigure(col_i, weight=wt)
+            btn = ctk.CTkButton(
+                actions, text=txt, height=26, font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color=fg, hover_color=hv, command=cmd,
+            )
+            btn.grid(row=0, column=col_i, padx=1, sticky="ew")
+            if cmd == self._on_find_highlights:
+                self.btn_find_highlights = btn
+            elif cmd == self._on_make_shorts:
+                self.btn_make_shorts = btn
+
+        self.shorts_info_label = ctk.CTkLabel(
+            actions, text="", font=ctk.CTkFont(size=11), text_color="#cbd5e1", anchor="w",
+        )
+        self.shorts_info_label.grid(row=1, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 0))
+
+        tree_box = ctk.CTkFrame(parent, fg_color="#1e293b", corner_radius=6)
+        tree_box.grid(row=2, column=0, sticky="nsew")
+        tree_box.grid_columnconfigure(0, weight=1)
+        tree_box.grid_rowconfigure(0, weight=1)
+
+        scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        columns = ("no", "use", "start", "dur", "clip", "reason", "score")
+        self.shorts_tree = ttk.Treeview(
+            tree_box, columns=columns, show="headings", height=4,
+            style="Review.Treeview", selectmode="browse",
+        )
+        for col, txt, base_wdt, anchor in [
+            ("no", "No", 40, "center"),
+            ("use", "사용", 56, "center"),
+            ("start", "위치", 80, "center"),
+            ("dur", "길이", 54, "e"),
+            ("clip", "클립", 48, "center"),
+            ("reason", "선정 이유", 100, "w"),
+            ("score", "점수", 110, "w"),
+        ]:
+            self.shorts_tree.heading(col, text=txt)
+            self.shorts_tree.column(
+                col, width=int(round(base_wdt * scaling)), anchor=anchor, stretch=(col == "score"),
+            )
+        self.shorts_tree.tag_configure("on", foreground="#67e8f9")
+        self.shorts_tree.tag_configure("off", foreground="#64748b")
+        self.shorts_tree.grid(row=0, column=0, sticky="nsew", padx=(4, 0), pady=4)
+        sb = ctk.CTkScrollbar(tree_box, command=self.shorts_tree.yview)
+        sb.grid(row=0, column=1, sticky="ns", pady=4)
+        self.shorts_tree.configure(yscrollcommand=sb.set)
+        self.shorts_tree.bind("<<TreeviewSelect>>", self._on_shorts_tree_select)
+        self.shorts_tree.bind("<Double-1>", lambda _e: self._shorts_toggle_selected())
+
+    # 설정 읽기
+
+    def _get_highlight_config(self) -> HighlightConfig:
+        def first_num(text: str, default: float) -> float:
+            try:
+                return float(text.split("초")[0].strip())
+            except ValueError:
+                return default
+
+        return HighlightConfig(
+            target_duration_sec=first_num(self.shorts_len_var.get(), 30.0),
+            clip_duration_sec=first_num(self.shorts_clip_var.get(), 3.0),
+            use_audio_peaks=bool(self.shorts_audio_peak_var.get()),
+        )
+
+    def _get_shorts_export_config(self, output_path: Path) -> ShortsExportConfig:
+        lay = self.shorts_layout_var.get()
+        if "꽉" in lay:
+            layout = ShortsLayout.VERTICAL_CROP
+        elif "가로" in lay:
+            layout = ShortsLayout.LANDSCAPE
+        else:
+            layout = ShortsLayout.VERTICAL_BLUR
+
+        aud = self.shorts_audio_var.get()
+        if aud == "배경음악만":
+            audio_mode = ShortsAudioMode.BGM
+        elif aud.startswith("원본 +"):
+            audio_mode = ShortsAudioMode.BGM_MIX
+        elif aud == "무음":
+            audio_mode = ShortsAudioMode.MUTE
+        else:
+            audio_mode = ShortsAudioMode.ORIGINAL
+
+        base = self._get_current_export_config(output_path)
+        return ShortsExportConfig(
+            output_path=output_path,
+            layout=layout,
+            resolution=self.shorts_res_var.get(),
+            audio_mode=audio_mode,
+            bgm_path=self.shorts_bgm_path,
+            title_text=self.shorts_title_entry.get().strip(),
+            show_timestamp=bool(self.shorts_ts_var.get()),
+            quality_preset=base.quality_preset,
+            use_hw_accel=base.use_hw_accel,
+        )
+
+    def _shorts_pick_bgm(self) -> None:
+        path_str = filedialog.askopenfilename(
+            title="쇼츠에 넣을 배경음악 선택",
+            filetypes=[("오디오 파일", "*.mp3 *.m4a *.aac *.wav *.flac *.ogg"), ("모든 파일", "*.*")],
+        )
+        if not path_str:
+            return
+        self.shorts_bgm_path = Path(path_str)
+        name = self.shorts_bgm_path.name
+        self.shorts_bgm_label.configure(text=f"🎵 {name if len(name) <= 22 else name[:20] + '…'}", text_color="#f9a8d4")
+        if self.shorts_audio_var.get() in ("원본 주행 소리", "무음"):
+            self.shorts_audio_var.set("원본 + 배경음악")
+
+    def _shorts_settings_changed(self) -> None:
+        """길이·장면 길이 등을 바꾸면, 분석 캐시가 준비된 경우 즉시 하이라이트를 다시 고릅니다."""
+        if self.is_busy or not self.highlight_clips or not self.videos:
+            return
+        hcfg = self._get_highlight_config()
+        ready = all(v.feature_cache is not None for v in self.videos)
+        if hcfg.use_audio_peaks:
+            ready = ready and all(
+                (not v.has_audio) or ("audio_db" in (v.feature_cache or {})) for v in self.videos
+            )
+        if not ready:
+            self.shorts_info_label.configure(text="⚙ 설정이 바뀌었습니다 — [✨ 하이라이트 찾기]를 다시 눌러 주세요.")
+            return
+        self._stop_preview_play()
+        self.highlight_clips = select_highlights(self.videos, hcfg)
+        self.highlight_index = None
+        self._refresh_shorts_ui()
+
+    # 목록 표시
+
+    def _hl_global(self, clip: HighlightClip) -> Optional[Tuple[float, float]]:
+        off = self._clip_offset(clip.video)
+        if off is None:
+            return None
+        return off + clip.start_sec, off + clip.end_sec
+
+    def _refresh_shorts_ui(self) -> None:
+        if not hasattr(self, "shorts_tree"):
+            return
+        present = {id(v) for v in self.videos}
+        if any(id(c.video) not in present for c in self.highlight_clips):
+            self.highlight_clips = [c for c in self.highlight_clips if id(c.video) in present]
+            self.highlight_index = None
+
+        tree = self.shorts_tree
+        tree.delete(*tree.get_children())
+        clip_no = {id(v): i + 1 for i, v in enumerate(self.videos)}
+        max_score = max((c.score for c in self.highlight_clips), default=0.0)
+        marks: List[Tuple[float, float]] = []
+        for i, c in enumerate(self.highlight_clips):
+            g = self._hl_global(c)
+            if g is None:
+                continue
+            if c.included:
+                marks.append(g)
+            rel = (c.score / max_score) if max_score > 0 else 0.0
+            bar = "█" * max(1, int(round(rel * 8)))
+            tree.insert(
+                "", "end", iid=str(i),
+                values=(
+                    i + 1, "✔ 사용" if c.included else "✕ 제외", format_duration(g[0], True),
+                    f"{c.duration:.1f}초", f"#{clip_no.get(id(c.video), '?')}", c.reason or "-",
+                    f"{bar} {rel * 100:.0f}",
+                ),
+                tags=("on" if c.included else "off",),
+            )
+        if self.highlight_index is not None and tree.exists(str(self.highlight_index)):
+            tree.selection_set(str(self.highlight_index))
+            tree.see(str(self.highlight_index))
+        self.global_timeline.set_marks(marks)
+
+        if not self.highlight_clips:
+            self.shorts_info_label.configure(
+                text="💡 [✨ 하이라이트 찾기]를 누르면 회전·풍경 변화·돌발 장면·경적 소리 등 볼 만한 순간을 자동으로 골라 줍니다."
+            )
+        else:
+            used = [c for c in self.highlight_clips if c.included]
+            self.shorts_info_label.configure(
+                text=(
+                    f"하이라이트 {len(used)}/{len(self.highlight_clips)}개 사용  ·  완성 길이 약 "
+                    f"{sum(c.duration for c in used):.0f}초  ·  클릭: 장면 재생 / 더블클릭·[X]: 포함·제외"
+                )
+            )
+
+    def _on_shorts_tree_select(self, _event=None) -> None:
+        sel = self.shorts_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if idx == self.highlight_index:
+            return
+        self._shorts_select(idx, autoplay=True)
+
+    def _shorts_select(self, idx: int, autoplay: bool) -> None:
+        if not (0 <= idx < len(self.highlight_clips)):
+            return
+        g = self._hl_global(self.highlight_clips[idx])
+        if g is None:
+            return
+        self.highlight_index = idx
+        self._stop_preview_play()
+        self.global_timeline.set_view(g[0] - 6.0, g[1] + 6.0)
+        self.global_timeline.set_highlight(g)
+        self.playhead_sec = g[0]
+        self._update_timeline_and_preview()
+        if autoplay:
+            self._start_preview_play(stop_at=g[1])
+
+    def _shorts_toggle_selected(self) -> None:
+        if self.left_tabs.get() != TAB_SHORTS:
+            return
+        idx = self.highlight_index
+        if idx is None or not (0 <= idx < len(self.highlight_clips)):
+            return
+        clip = self.highlight_clips[idx]
+        clip.included = not clip.included
+        self._refresh_shorts_ui()
+
+    def _shorts_preview_all(self) -> None:
+        """사용(✔)으로 표시된 하이라이트 장면들을 쇼츠 순서대로 이어서 미리 재생합니다."""
+        order = [i for i, c in enumerate(self.highlight_clips) if c.included]
+        if not order:
+            messagebox.showinfo("미리보기", "미리 볼 하이라이트 장면이 없습니다. [✨ 하이라이트 찾기]를 먼저 눌러 주세요.")
+            return
+        self._stop_preview_play()
+        self.global_timeline.zoom_full()
+        self._hl_play_queue = order
+        self._shorts_play_next_in_queue()
+        if self.is_playing_preview:
+            self._playback_poll()
+
+    def _shorts_play_next_in_queue(self) -> None:
+        while self._hl_play_queue:
+            idx = self._hl_play_queue.pop(0)
+            g = self._hl_global(self.highlight_clips[idx]) if idx < len(self.highlight_clips) else None
+            if g is None:
+                continue
+            self.highlight_index = idx
+            if self.shorts_tree.exists(str(idx)):
+                self.shorts_tree.selection_set(str(idx))
+                self.shorts_tree.see(str(idx))
+            self.global_timeline.set_highlight(g)
+            self.playhead_sec = g[0]
+            self._play_stop_at = g[1]
+            if not self.is_playing_preview:
+                self.is_playing_preview = True
+                self.btn_play_preview.configure(text="⏸ 일시정지", fg_color="#d97706")
+            self._playback.stop()
+            self._launch_playback()
+            return
+
+    # 하이라이트 찾기 / 쇼츠 만들기
+
+    def _compute_highlights_in_worker(
+        self, acfg: AnalysisConfig, hcfg: HighlightConfig, prog_scale: float,
+    ) -> List[HighlightClip]:
+        """(작업 스레드) 미분석 영상 분석 → 오디오 음량 추출 → 하이라이트 선정. 진행률 0~prog_scale."""
+        videos = list(self.videos)
+        total_v = max(1, len(videos))
+
+        def report(frac: float, msg: str) -> None:
+            self.after(0, lambda f=frac, m=msg: (
+                self.progress_bar.set(f * prog_scale), self.status_label.configure(text=m)
+            ))
+
+        for idx, v in enumerate(videos):
+            if self.cancel_requested:
+                raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
+            if v.feature_cache is None:
+                def on_prog(frac: float, i=idx, name=v.filename):
+                    report((i + frac * 0.85) / total_v, f"[하이라이트] 주행 장면 분석 {i + 1}/{total_v}: {name} ({frac * 100:.0f}%)")
+
+                old_segs = list(v.segments)
+                segs = analyze_video(v, acfg, progress_callback=on_prog, cancel_check=lambda: self.cancel_requested)
+                if self.cancel_requested:
+                    raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
+                if not v.analyzed:
+                    v.segments = merge_preserving_manual_cuts(old_segs, segs, v.duration_sec)
+                    v.analyzed = True
+                self.after(0, lambda: (self._refresh_video_list_ui(), self._update_timeline_and_preview()))
+            if hcfg.use_audio_peaks and v.has_audio:
+                report((idx + 0.9) / total_v, f"[하이라이트] 소리 이벤트(경적 등) 분석 {idx + 1}/{total_v}: {v.filename}")
+                ensure_audio_levels(v, cancel_check=lambda: self.cancel_requested)
+        if self.cancel_requested:
+            raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
+        report(1.0, "[하이라이트] 볼 만한 장면을 고르는 중...")
+        return select_highlights(videos, hcfg)
+
+    def _on_find_highlights(self) -> None:
+        if self.is_busy:
+            return
+        if not self.videos:
+            messagebox.showwarning("알림", "먼저 주행 영상 파일을 추가해 주세요.")
+            return
+        self._stop_preview_play()
+        self.left_tabs.set(TAB_SHORTS)
+        acfg = self._get_current_analysis_config()
+        hcfg = self._get_highlight_config()
+        self._set_busy_state(True, "하이라이트 장면을 찾는 중...")
+        self.progress_bar.set(0.0)
+
+        def worker():
+            try:
+                clips = self._compute_highlights_in_worker(acfg, hcfg, 1.0)
+
+                def done():
+                    self.highlight_clips = clips
+                    self.highlight_index = None
+                    self.progress_bar.set(1.0)
+                    self._refresh_shorts_ui()
+                    total = sum(c.duration for c in clips)
+                    self._set_busy_state(
+                        False,
+                        f"✨ 하이라이트 {len(clips)}개 선정 (약 {total:.0f}초) — 목록에서 장면을 확인하고 [🎬 쇼츠 만들기]를 누르세요."
+                        if clips else "하이라이트로 쓸 만한 주행 장면을 찾지 못했습니다 (정차·잘라내기 구간은 제외됩니다).",
+                    )
+
+                self.after(0, done)
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._on_shorts_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_shorts_error(self, err_msg: str) -> None:
+        self.progress_bar.set(0.0)
+        self._set_busy_state(False, f"❌ 작업 중단: {err_msg}")
+        if "취소" not in err_msg:
+            messagebox.showerror("오류 발생", err_msg)
+
+    def _on_make_shorts(self) -> None:
+        if self.is_busy:
+            return
+        if not self.videos:
+            messagebox.showwarning("알림", "먼저 주행 영상 파일을 추가해 주세요.")
+            return
+        probe_cfg = self._get_shorts_export_config(Path("shorts.mp4"))
+        if probe_cfg.audio_mode in (ShortsAudioMode.BGM, ShortsAudioMode.BGM_MIX) and not (
+            self.shorts_bgm_path and self.shorts_bgm_path.exists()
+        ):
+            messagebox.showwarning("배경음악", "배경음악을 쓰려면 [🎵 음악 선택]으로 음악 파일을 먼저 골라 주세요.")
+            return
+
+        self._stop_preview_play()
+        default_name = f"highlight_shorts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        save_path_str = filedialog.asksaveasfilename(
+            title="하이라이트 쇼츠 영상을 저장할 위치 선택",
+            initialdir=str(self.videos[0].path.parent),
+            initialfile=default_name,
+            defaultextension=".mp4",
+            filetypes=[("MP4 비디오", "*.mp4")],
+        )
+        if not save_path_str:
+            return
+        output_path = Path(save_path_str).resolve()
+        if any(v.path.resolve() == output_path for v in self.videos):
+            messagebox.showerror("오류", "원본 영상 파일과 동일한 이름으로 덮어쓸 수 없습니다. 다른 파일명을 지정해 주세요.")
+            return
+
+        shorts_cfg = self._get_shorts_export_config(output_path)
+        need_search = not any(c.included for c in self.highlight_clips)
+        acfg = self._get_current_analysis_config()
+        hcfg = self._get_highlight_config()
+        self.left_tabs.set(TAB_SHORTS)
+        self._set_busy_state(True, "하이라이트 쇼츠 만들기를 시작합니다...")
+        self.progress_bar.set(0.0)
+
+        def worker():
+            try:
+                if need_search:
+                    clips = self._compute_highlights_in_worker(acfg, hcfg, 0.3)
+                    self.highlight_clips = clips
+                    self.after(0, self._refresh_shorts_ui)
+                base = 0.3 if need_search else 0.0
+                # 하이라이트를 고른 뒤 사용자가 잘라낸(삭제한) 영상 부분은 쇼츠에도 넣지 않음
+                use = [
+                    c for c in self.highlight_clips
+                    if c.included and self._type_coverage(c.video, c.start_sec, c.end_sec, SegmentType.MANUAL_CUT) < 0.3
+                ]
+
+                def on_prog(frac: float, msg: str):
+                    self.after(0, lambda f=base + frac * (1.0 - base), m=msg: (
+                        self.progress_bar.set(f), self.status_label.configure(text=f"[쇼츠 만들기] {m}")
+                    ))
+
+                final_path = render_highlight_shorts(
+                    use, shorts_cfg, progress_callback=on_prog, cancel_check=lambda: self.cancel_requested,
+                )
+
+                def on_success():
+                    self.last_output_path = final_path
+                    self.progress_bar.set(1.0)
+                    self.btn_open_folder.configure(state="normal")
+                    self._set_busy_state(False, f"✅ 쇼츠 완성! 저장된 파일: {final_path}")
+                    messagebox.showinfo(
+                        "쇼츠 완성",
+                        f"하이라이트 쇼츠 영상이 완성되었습니다!\n\n장면 {len(use)}개 · 약 "
+                        f"{sum(c.duration for c in use):.0f}초\n\n저장 경로:\n{final_path}",
+                    )
+
+                self.after(0, on_success)
+            except Exception as exc:
+                err = str(exc)
+                self.after(0, lambda: self._on_shorts_error(err))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── UI 설정 이벤트 핸들러 ──
 
@@ -2943,9 +3481,10 @@ class QuickDashCamApp(ctk.CTk):
         self._refresh_video_list_ui()
 
     def _refresh_video_list_ui(self) -> None:
-        # 구간이 바뀌었을 수 있으므로 리뷰 목록도 함께 동기화
+        # 구간이 바뀌었을 수 있으므로 리뷰 목록·하이라이트 목록도 함께 동기화
         self._rebuild_review_items()
         self._refresh_review_ui()
+        self._refresh_shorts_ui()
 
         for child in self.list_scroll.winfo_children():
             child.destroy()
@@ -3098,6 +3637,8 @@ class QuickDashCamApp(ctk.CTk):
         self.btn_down.configure(state=state_normal)
         self.btn_analyze.configure(state=state_normal)
         self.btn_export.configure(state=state_normal)
+        self.btn_find_highlights.configure(state=state_normal)
+        self.btn_make_shorts.configure(state=state_normal)
         self.btn_cancel.configure(state="normal" if busy else "disabled")
 
         if status_msg is not None:
@@ -3187,7 +3728,7 @@ class QuickDashCamApp(ctk.CTk):
                         f"자동 구간 분석 완료! 검출 구간 {n_items}개 — [🔎 검출 구간 리뷰] 탭의 [▶ 리뷰 시작]으로 하나씩 확인·결정할 수 있습니다.",
                     )
                     if n_items:
-                        self.left_tabs.set("🔎 검출 구간 리뷰")
+                        self.left_tabs.set(TAB_REVIEW)
                 self._refresh_video_list_ui()
                 self._update_timeline_and_preview()
 
