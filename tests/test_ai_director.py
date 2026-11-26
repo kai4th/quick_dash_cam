@@ -22,6 +22,7 @@ from src.ai_director import (  # noqa: E402
     RESULT_SCHEMA,
     AiDirectorError,
     ai_select_highlights,
+    candidate_count_for,
     apply_ai_result,
     parse_cli_output,
 )
@@ -66,6 +67,14 @@ def test_apply_ai_result() -> None:
     assert clips[2].caption == "바다가 보인다", clips[2].caption
     assert clips[0].ai_score is None and clips[0].reason == "회전·커브", "unrated candidates keep algorithm reason"
     print("[PASS] AI result validation (unknown ids, duplicates, clamping, fill, emoji strip)")
+
+
+def test_candidate_counts() -> None:
+    cases = {(30.0, 3.0): (10, 50), (15.0, 3.0): (5, 25), (90.0, 3.0): (30, 80), (6.0, 3.0): (2, 20)}
+    for (target, clip), want in cases.items():
+        got = candidate_count_for(HighlightConfig(target_duration_sec=target, clip_duration_sec=clip))
+        assert got == want, f"{target}s/{clip}s -> {got}, expected {want}"
+    print("[PASS] Candidate counts: ~5x final cuts (min 20, max 80)")
 
 
 def test_parse_cli_output() -> None:
@@ -241,6 +250,7 @@ def test_claude_api_backend(videos: list, tmp: Path) -> None:
 
 if __name__ == "__main__":
     test_apply_ai_result()
+    test_candidate_counts()
     test_parse_cli_output()
     with tempfile.TemporaryDirectory(prefix="qdc_ai_") as t:
         tmp_dir = Path(t)

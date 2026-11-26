@@ -17,6 +17,7 @@ from src.analyzer import analyze_video, reclassify_from_cache
 from src.ffmpeg_utils import get_CreationFlags, get_ffmpeg_exe, probe_video_file
 from src.models import (
     AnalysisConfig,
+    HighlightClip,
     AudioMode,
     ExportConfig,
     HighlightConfig,
@@ -24,6 +25,7 @@ from src.models import (
     ShortsAudioMode,
     ShortsExportConfig,
     ShortsLayout,
+    ShortsTransition,
     SkipMode,
     SortMode,
     VideoCodec,
@@ -378,8 +380,47 @@ def test_highlight_shorts() -> None:
         print("[PASS] Excluded clip, 720p crop layout & looping BGM mix verified!")
 
 
+def _frame_at(path: Path, t: float) -> np.ndarray:
+    raw = subprocess.run(
+        [get_ffmpeg_exe(), "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(path), "-frames:v", "1",
+         "-vf", "scale=72:128", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        stdout=subprocess.PIPE, check=True, creationflags=get_CreationFlags(),
+    ).stdout
+    return np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+
+
+def test_shorts_transitions() -> None:
+    with tempfile.TemporaryDirectory(prefix="qdc_tr_") as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / "VID_20261024_090000.mp4"
+        _create_synthetic_driving_video(src, duration_sec=32, fps=20)
+        v = probe_video_file(src)
+        clips = [HighlightClip(v, 16.0, 19.0), HighlightClip(v, 24.0, 27.0), HighlightClip(v, 28.0, 31.0)]
+        durs = {}
+        for tr in ShortsTransition:
+            out = tmp_dir / f"tr_{tr.value}.mp4"
+            render_highlight_shorts(clips, ShortsExportConfig(
+                output_path=out, resolution="720p", transition=tr, transition_sec=0.5, show_timestamp=False,
+            ))
+            p = probe_video_file(out)
+            assert p.has_audio, f"{tr.value}: audio missing"
+            durs[tr.value] = p.duration_sec
+        print("Transition durations:", {k: round(d, 2) for k, d in durs.items()})
+        for k, d in durs.items():
+            assert abs(d - 9.0) < 0.6, f"{k}: crossfade must not shorten the shorts much ({d:.2f}s)"
+        # 디졸브 전환 한가운데(3.25초)는 앞 컷 끝(2.9초)·뒤 컷 시작(3.6초)과 다른 '섞인' 화면이어야 함
+        d = tmp_dir / "tr_dissolve.mp4"
+        a, mid, b = _frame_at(d, 2.9), _frame_at(d, 3.25), _frame_at(d, 3.6)
+        cut_mid = _frame_at(tmp_dir / "tr_cut.mp4", 3.25)
+        diffs = [float(np.abs(mid - x).mean()) for x in (a, b, cut_mid)]
+        print("Dissolve midpoint diff vs (prev cut, next cut, hard-cut frame):", [round(x, 1) for x in diffs])
+        assert all(x > 3 for x in diffs), "dissolve midpoint should be a blend, not either cut"
+        print("[PASS] Cross-dissolve / fade-through-black / cut transitions verified!")
+
+
 if __name__ == "__main__":
     test_sorter()
     test_analysis_and_export()
     test_highlight_shorts()
+    test_shorts_transitions()
     print("ALL TESTS PASSED SUCCESSFULLY!")

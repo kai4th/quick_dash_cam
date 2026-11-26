@@ -302,6 +302,12 @@ class AiDirectorMode(str, Enum):
     CLAUDE_API = "claude_api"    # Claude API(API 키, 사용량 과금)로 장면 선정
 
 
+class ShortsTransition(str, Enum):
+    DISSOLVE = "dissolve"     # 크로스 디졸브: 앞 컷과 뒤 컷이 겹치며 자연스럽게 섞임 (소리도 크로스페이드)
+    FADE_BLACK = "fadeblack"  # 검은 화면을 잠깐 거쳐 부드럽게 전환
+    CUT = "cut"               # 바로 컷 (전환 효과 없음)
+
+
 class ShortsAudioMode(str, Enum):
     ORIGINAL = "original"  # 원본 주행 소리
     BGM = "bgm"            # 배경음악으로 교체
@@ -343,7 +349,9 @@ class ShortsExportConfig:
     audio_mode: ShortsAudioMode = ShortsAudioMode.ORIGINAL
     bgm_path: Optional[Path] = None
     bgm_volume: float = 0.6
-    fade_sec: float = 0.25                # 장면 전환 페이드 길이
+    fade_sec: float = 0.3                 # 쇼츠 맨 처음 페이드 인 / 맨 끝 페이드 아웃 길이
+    transition: ShortsTransition = ShortsTransition.DISSOLVE
+    transition_sec: float = 0.5           # 컷 사이 전환(겹침) 길이
     title_text: str = ""                  # 화면 상단 제목 (빈 문자열이면 표시 안 함)
     show_timestamp: bool = True           # 장면별 촬영 시각 표시
     show_captions: bool = False           # AI가 제안한 장면 자막 표시

@@ -40,6 +40,7 @@ from .models import (
     ShortsAudioMode,
     ShortsExportConfig,
     ShortsLayout,
+    ShortsTransition,
     SkipMode,
     SortMode,
     VideoCodec,
@@ -2798,9 +2799,16 @@ class QuickDashCamApp(ctk.CTk):
             row4, text="AI 장면 자막 표시", variable=self.shorts_caption_var, font=ctk.CTkFont(size=10),
             checkbox_width=16, checkbox_height=16,
         ).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(
-            row4, text="🤖 AI: 후보를 넉넉히 뽑아 Claude가 사진을 보고 최종 장면·제목·자막을 정합니다",
-            font=ctk.CTkFont(size=10), text_color="#94a3b8",
+        ctk.CTkLabel(row4, text="전환", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_transition_var = ctk.StringVar(value="크로스 디졸브 (권장)")
+        ctk.CTkOptionMenu(
+            row4, values=["크로스 디졸브 (권장)", "검은 화면 페이드", "바로 컷"],
+            variable=self.shorts_transition_var, width=138, height=24, font=small,
+        ).pack(side="left", padx=(0, 4))
+        self.shorts_transition_len_var = ctk.StringVar(value="0.5초")
+        ctk.CTkOptionMenu(
+            row4, values=["0.3초", "0.5초", "0.8초", "1.0초"],
+            variable=self.shorts_transition_len_var, width=70, height=24, font=small,
         ).pack(side="left")
 
         actions = ctk.CTkFrame(parent, fg_color="transparent")
@@ -2910,6 +2918,18 @@ class QuickDashCamApp(ctk.CTk):
         else:
             audio_mode = ShortsAudioMode.ORIGINAL
 
+        tr = self.shorts_transition_var.get()
+        if tr.startswith("검은"):
+            transition = ShortsTransition.FADE_BLACK
+        elif tr.startswith("바로"):
+            transition = ShortsTransition.CUT
+        else:
+            transition = ShortsTransition.DISSOLVE
+        try:
+            transition_sec = float(self.shorts_transition_len_var.get().split("초")[0])
+        except ValueError:
+            transition_sec = 0.5
+
         base = self._get_current_export_config(output_path)
         return ShortsExportConfig(
             output_path=output_path,
@@ -2920,6 +2940,8 @@ class QuickDashCamApp(ctk.CTk):
             title_text=self.shorts_title_entry.get().strip(),
             show_timestamp=bool(self.shorts_ts_var.get()),
             show_captions=bool(self.shorts_caption_var.get()),
+            transition=transition,
+            transition_sec=transition_sec,
             quality_preset=base.quality_preset,
             use_hw_accel=base.use_hw_accel,
         )

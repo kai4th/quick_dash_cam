@@ -2,7 +2,7 @@
 Claude가 하이라이트 장면을 골라 주는 "AI 편집자".
 
 흐름
-1) 알고리즘(highlights.select_highlights)으로 목표 장면 수의 약 3배 후보를 넉넉히 뽑습니다.
+1) 알고리즘으로 목표 장면 수의 약 5배 후보를 서로 다른 모습 위주로 넉넉히 뽑습니다.
 2) 후보마다 시작·중간·끝 3프레임을 가로로 이어 붙이고, 후보 6개씩 한 장의 "콘택트 시트" 이미지로 묶습니다.
    (이미지 장수를 줄여 Claude Code가 파일을 읽는 횟수와 API 토큰 비용을 모두 줄임)
 3) Claude에게 후보별 점수·장면 설명·자막과, 최종으로 쓸 장면 번호·쇼츠 제목을 JSON으로 받습니다.
@@ -81,9 +81,9 @@ class ContactSheet:
 # ── 1. 후보 장면 → 콘택트 시트 이미지 ──
 
 def candidate_count_for(hcfg: HighlightConfig) -> Tuple[int, int]:
-    """(최종 장면 수, 후보 수). 후보는 최종 장면 수의 약 3배 (최소 12, 최대 45)."""
+    """(최종 장면 수, 후보 수). 후보는 최종 장면 수의 약 5배 (최소 20, 최대 80)."""
     n_final = max(1, int(round(hcfg.target_duration_sec / max(1.0, hcfg.clip_duration_sec))))
-    n_cand = int(min(45, max(12, n_final * 3)))
+    n_cand = int(min(80, max(20, n_final * 5)))
     return n_final, n_cand
 
 

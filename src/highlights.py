@@ -34,6 +34,7 @@ from .models import (
     ShortsAudioMode,
     ShortsExportConfig,
     ShortsLayout,
+    ShortsTransition,
     VideoCodec,
     VideoFileInfo,
 )
@@ -826,6 +827,8 @@ def _build_clip_filtergraph(
     font_ts: Optional[str],
     caption_file: Optional[Path] = None,
     font_caption: Optional[str] = None,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
 ) -> str:
     v = clip.video
     if cfg.layout == ShortsLayout.VERTICAL_BLUR:
@@ -881,9 +884,11 @@ def _build_clip_filtergraph(
             y = f"{out_h * 0.90:.0f}"
         graph += "," + _drawtext(font_ts, ts_file, fs, y, boxed=not use_band)
 
-    f = max(0.0, cfg.fade_sec)
-    if f > 0 and out_dur > f * 3:
-        graph += f",fade=t=in:st=0:d={f:.3f},fade=t=out:st={out_dur - f:.3f}:d={f:.3f}"
+    # 컷 사이 전환은 이어 붙이는 단계(xfade)에서 처리하고, 여기서는 쇼츠 맨 처음/맨 끝 페이드만 적용
+    if fade_in > 0 and out_dur > fade_in * 2:
+        graph += f",fade=t=in:st=0:d={fade_in:.3f}"
+    if fade_out > 0 and out_dur > fade_out * 2:
+        graph += f",fade=t=out:st={out_dur - fade_out:.3f}:d={fade_out:.3f}"
     graph += ",setsar=1,format=yuv420p[v]"
     return graph
 
@@ -934,11 +939,14 @@ def _encode_highlight_clip(
     cancel_check: Optional[Callable[[], bool]],
     caption_file: Optional[Path] = None,
     font_caption: Optional[str] = None,
+    dur: Optional[float] = None,
+    fade_in: float = 0.0,
+    fade_out: float = 0.0,
 ) -> Tuple[bool, str]:
-    dur = clip.duration
+    dur = clip.duration if dur is None else dur
     graph = _build_clip_filtergraph(
         clip, cfg, out_w, out_h, dur, title_file, cfg.title_text.strip(), ts_file, font_title, font_ts,
-        caption_file, font_caption,
+        caption_file, font_caption, fade_in, fade_out,
     )
     cmd: List[str] = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -953,9 +961,12 @@ def _encode_highlight_clip(
     if with_audio:
         a_in = "[0:a:0]" if use_src_audio else "[1:a]"
         a_chain = "aformat=sample_rates=48000:channel_layouts=stereo,aresample=async=1:first_pts=0"
-        f = max(0.0, cfg.fade_sec)
-        if f > 0 and dur > f * 3:
-            a_chain += f",afade=t=in:st=0:d={f:.3f},afade=t=out:st={dur - f:.3f}:d={f:.3f}"
+        if fade_in > 0 and dur > fade_in * 2:
+            a_chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+        if fade_out > 0 and dur > fade_out * 2:
+            a_chain += f",afade=t=out:st={dur - fade_out:.3f}:d={fade_out:.3f}"
+        # 이어 붙이기·크로스페이드에서 길이가 정확히 맞도록 무음으로 채운 뒤 자름
+        a_chain += f",apad,atrim=duration={dur:.3f}"
         graph += f";{a_in}{a_chain}[a]"
 
     cmd += ["-filter_complex", graph, "-map", "[v]"]
@@ -1022,6 +1033,54 @@ def _mix_background_music(
     raise RuntimeError(f"배경음악을 입히는 중 오류가 발생했습니다:\n{last_err}")
 
 
+def _join_with_transitions(
+    ffmpeg: str,
+    seg_files: List[Path],
+    seg_durs: List[float],
+    trans_sec: float,
+    transition: ShortsTransition,
+    with_audio: bool,
+    encoder_name: str,
+    encoder_args: List[str],
+    out_path: Path,
+    cancel_check: Optional[Callable[[], bool]],
+) -> Tuple[bool, str]:
+    """
+    컷들을 xfade(영상) + acrossfade(소리)로 겹쳐 잇습니다.
+    i번째 전환 시작 시점 = (지금까지 이어 붙인 길이) - 전환 길이.
+    """
+    xname = "fadeblack" if transition == ShortsTransition.FADE_BLACK else "fade"
+    cmd: List[str] = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+    for sf in seg_files:
+        cmd += ["-i", str(sf)]
+    parts: List[str] = []
+    for i in range(len(seg_files)):
+        parts.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[v{i}]")
+        if with_audio:
+            parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+    prev_v, prev_a = "v0", "a0"
+    joined_len = seg_durs[0]
+    for i in range(1, len(seg_files)):
+        offset = max(0.0, joined_len - trans_sec)
+        parts.append(
+            f"[{prev_v}][v{i}]xfade=transition={xname}:duration={trans_sec:.3f}:offset={offset:.3f}[x{i}]"
+        )
+        prev_v = f"x{i}"
+        if with_audio:
+            parts.append(f"[{prev_a}][a{i}]acrossfade=d={trans_sec:.3f}:c1=tri:c2=tri[y{i}]")
+            prev_a = f"y{i}"
+        joined_len = offset + seg_durs[i]
+    parts.append(f"[{prev_v}]format=yuv420p[vout]")
+    cmd += ["-filter_complex", ";".join(parts), "-map", "[vout]"]
+    if with_audio:
+        cmd += ["-map", f"[{prev_a}]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-c:v", encoder_name, *encoder_args, "-movflags", "+faststart", str(out_path)]
+    ok, err = _run_ffmpeg(cmd, cancel_check)
+    return ok and out_path.exists() and out_path.stat().st_size > 0, err
+
+
 def render_highlight_shorts(
     clips: List[HighlightClip],
     cfg: ShortsExportConfig,
@@ -1055,8 +1114,18 @@ def render_highlight_shorts(
 
     output_path = Path(cfg.output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    total_dur = sum(c.duration for c in use_clips)
+
+    n = len(use_clips)
+    use_xfade = cfg.transition != ShortsTransition.CUT and n >= 2 and cfg.transition_sec > 0
+    trans = min(cfg.transition_sec, min(c.duration for c in use_clips) / 3.0) if use_xfade else 0.0
+    # 겹치는 만큼 쇼츠가 짧아지지 않도록 마지막을 제외한 컷은 전환 길이만큼 뒤로 늘려서 렌더링
+    seg_durs: List[float] = []
+    for idx, c in enumerate(use_clips):
+        extend = trans if idx < n - 1 else 0.0
+        seg_durs.append(max(trans * 2.5, min(c.duration + extend, c.video.duration_sec - c.start_sec)))
+    total_dur = sum(seg_durs) - trans * (n - 1)
     done_dur = 0.0
+    encode_share = 0.8 if use_xfade else 0.9
 
     with tempfile.TemporaryDirectory(prefix="quick_dash_cam_shorts_") as tmp_str:
         tmp = Path(tmp_str)
@@ -1071,7 +1140,7 @@ def render_highlight_shorts(
                 raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
             if progress_callback:
                 progress_callback(
-                    min(0.9, done_dur / max(0.1, total_dur) * 0.9),
+                    min(encode_share, done_dur / max(0.1, sum(seg_durs)) * encode_share),
                     f"쇼츠 장면 인코딩 [{idx + 1}/{len(use_clips)}]: {clip.video.filename} "
                     f"({clip.start_sec:.1f}s~, {clip.reason or '하이라이트'})",
                 )
@@ -1090,11 +1159,16 @@ def render_highlight_shorts(
             seg_path = tmp / f"hl_{idx:04d}.ts"
             args = (ffmpeg, clip, cfg, seg_path, out_w, out_h)
             extra = (clip_audio, title_file, ts_file, font_title, font_ts, cancel_check, caption_file, font_caption)
-            ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra)
+            timing = dict(
+                dur=seg_durs[idx],
+                fade_in=cfg.fade_sec if idx == 0 else 0.0,
+                fade_out=cfg.fade_sec if idx == n - 1 else 0.0,
+            )
+            ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra, **timing)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):
                 # 하드웨어 인코더 실패 시 소프트웨어 인코더로 자동 폴백
                 enc_name, enc_args = sw_name, sw_args
-                ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra)
+                ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra, **timing)
             if not ok:
                 if cancel_check and cancel_check():
                     raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
@@ -1104,26 +1178,33 @@ def render_highlight_shorts(
                     f"({clip.start_sec:.1f}s ~ {clip.end_sec:.1f}s){detail}"
                 )
             seg_files.append(seg_path)
-            done_dur += clip.duration
-
-        if progress_callback:
-            progress_callback(0.92, "하이라이트 장면들을 하나의 쇼츠 영상으로 잇는 중...")
-
-        concat_list = tmp / "concat_list.txt"
-        with open(concat_list, "w", encoding="utf-8") as fh:
-            for sf in seg_files:
-                fh.write(f"file '{str(sf.resolve()).replace(chr(92), '/')}'\n")
+            done_dur += seg_durs[idx]
 
         joined = tmp / "joined.mp4" if needs_bgm else output_path
-        concat_cmd = [
-            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", str(concat_list),
-            "-c", "copy",
-        ]
-        if clip_audio:
-            concat_cmd += ["-bsf:a", "aac_adtstoasc"]
-        concat_cmd += ["-movflags", "+faststart", str(joined)]
-        ok, err = _run_ffmpeg(concat_cmd, cancel_check)
+        if use_xfade:
+            if progress_callback:
+                name = "크로스 디졸브" if cfg.transition == ShortsTransition.DISSOLVE else "페이드"
+                progress_callback(encode_share, f"장면 사이를 {name}로 자연스럽게 잇는 중...")
+            jargs = (ffmpeg, seg_files, seg_durs, trans, cfg.transition, clip_audio)
+            ok, err = _join_with_transitions(*jargs, enc_name, enc_args, joined, cancel_check)
+            if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):
+                ok, err = _join_with_transitions(*jargs, sw_name, sw_args, joined, cancel_check)
+        else:
+            if progress_callback:
+                progress_callback(0.92, "하이라이트 장면들을 하나의 쇼츠 영상으로 잇는 중...")
+            concat_list = tmp / "concat_list.txt"
+            with open(concat_list, "w", encoding="utf-8") as fh:
+                for sf in seg_files:
+                    fh.write(f"file '{str(sf.resolve()).replace(chr(92), '/')}'\n")
+            concat_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                "-c", "copy",
+            ]
+            if clip_audio:
+                concat_cmd += ["-bsf:a", "aac_adtstoasc"]
+            concat_cmd += ["-movflags", "+faststart", str(joined)]
+            ok, err = _run_ffmpeg(concat_cmd, cancel_check)
         if not ok or not joined.exists():
             if cancel_check and cancel_check():
                 raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
