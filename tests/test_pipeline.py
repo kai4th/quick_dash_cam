@@ -486,11 +486,29 @@ def test_horizon_leveling_and_quality() -> None:
             ).stdout
             after, _n = frame_roll_estimate(np.frombuffer(raw, dtype=np.uint8).reshape(360, 640))
             assert after is not None and abs(after) < 0.6, f"leveled output still tilted: {after}"
-            assert notes and "바로잡음" in notes[0], notes
+            assert notes and "보정" in notes[0], notes
             results[deg] = (round(angle, 2), round(after, 2))
         straight, _c = estimate_roll_angle(probe_video_file(src))
         assert abs(straight) < 0.3, f"level footage must not be rotated: {straight}"
         print("[PASS] Horizon leveling (tilt -> estimated, after):", results)
+
+        # 주행 중 카메라가 돌아간 영상(앞 16초만 3° 기울어짐): 기울어진 컷만 보정하고 수평인 컷은 건드리지 않아야 함
+        nudge = tmp_dir / "nudge.mp4"
+        subprocess.run(
+            [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-vf",
+             "rotate='if(lt(t,16),3,0)*PI/180':ow=iw:oh=ih:c=black,scale=iw*1.12:-2,crop=640:360",
+             "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy", str(nudge)],
+            check=True, creationflags=get_CreationFlags(),
+        )
+        nv = probe_video_file(nudge)
+        notes = []
+        render_highlight_shorts([HighlightClip(nv, 2.0, 5.0), HighlightClip(nv, 24.0, 27.0)], ShortsExportConfig(
+            output_path=tmp_dir / "nudge_out.mp4", layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False,
+        ), notes=notes)
+        print("Per-cut leveling notes:", notes)
+        assert any("컷 1" in n_ and "+3.0°" in n_ for n_ in notes), notes
+        assert not any("컷 2" in n_ and "보정" in n_ for n_ in notes), f"level cut must not be rotated: {notes}"
+        print("[PASS] Per-cut leveling: only the tilted cut is corrected when the camera moved mid-drive")
 
 
 if __name__ == "__main__":

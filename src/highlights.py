@@ -883,7 +883,7 @@ def _overlay_alpha(t1: float, t2: float, fade: float = 0.3) -> Optional[str]:
 
 # ── 수평(지평선) 자동 보정 ──
 
-ROLL_CACHE_VERSION = "roll_v1"
+ROLL_CACHE_VERSION = "roll_v3"
 ROLL_SAMPLE_FRAMES = 18
 ROLL_MAX_DEG = 8.0
 ROLL_MIN_APPLY_DEG = 0.3
@@ -912,9 +912,16 @@ def frame_roll_estimate(gray: np.ndarray) -> Tuple[Optional[float], int]:
         return None, 0
     devs: List[float] = []
     weights: List[float] = []
+    cx, cy = w / 2.0, h / 2.0
+    half_diag = math.hypot(cx, cy)
     for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):  # OpenCV 버전에 따라 (N,1,4) 또는 (N,4)
         dx, dy = float(x2 - x1), float(y2 - y1)
         length = math.hypot(dx, dy)
+        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        if my > h * 0.88:
+            continue  # 화면 맨 아래(보닛·대시보드)는 광각 렌즈에서 휘어 보여 기울기 판단에서 제외
+        # 광각(액션캠) 렌즈는 가장자리 직선이 휘어 보이므로 화면 중앙에 가까운 선일수록 더 신뢰
+        centrality = max(0.1, 1.0 - (math.hypot(mx - cx, my - cy) / half_diag) ** 2)
         a = math.degrees(math.atan2(dy, dx))
         if a <= -90.0:
             a += 180.0
@@ -927,8 +934,9 @@ def frame_roll_estimate(gray: np.ndarray) -> Tuple[Optional[float], int]:
         else:
             continue  # 차선처럼 비스듬한 선은 원근 때문에 기울기 판단에 쓰지 않음
         devs.append(dev)
-        weights.append(length)
-    if len(devs) < 8:
+        weights.append(length * centrality)
+    # 선 개수보다 '믿을 만한 직선 길이의 합'으로 판단 (고속도로처럼 화면을 가로지르는 지평선 하나도 충분히 신뢰)
+    if len(devs) < 3 or sum(weights) < w * 0.5:
         return None, len(devs)
     return _weighted_median(np.array(devs), np.array(weights)), len(devs)
 
@@ -943,6 +951,68 @@ def _roll_cache_path(video_path: Path) -> Optional[Path]:
         return cache_dir / f"roll_{digest}.json"
     except Exception:
         return None
+
+
+def _grab_gray_frames(
+    video: VideoFileInfo,
+    times: List[float],
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> List[Optional[np.ndarray]]:
+    """지정한 시각들의 프레임을 640px 폭 흑백으로 가져옵니다 (4개씩 병렬)."""
+    sw = 640
+    sh = max(2, int(round(sw * max(1, video.height) / max(1, video.width) / 2)) * 2)
+    ffmpeg = get_ffmpeg_exe()
+
+    def grab(t: float) -> Optional[np.ndarray]:
+        if cancel_check and cancel_check():
+            return None
+        try:
+            res = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(video.path),
+                 "-frames:v", "1", "-vf", f"scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, creationflags=get_CreationFlags(),
+            )
+            if len(res.stdout) >= sw * sh:
+                return np.frombuffer(res.stdout[: sw * sh], dtype=np.uint8).reshape(sh, sw)
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return list(pool.map(grab, times))
+
+
+VIDEO_ROLL_TRUST = 0.75    # 컷 단위 판단이 안 될 때 영상 전체 추정값을 쓰려면 프레임의 75% 이상이 같은 각도여야 함
+CLIP_ROLL_FRAMES = 5
+CLIP_ROLL_MAX_SPREAD = 1.0  # 컷 안 프레임별 추정값이 이보다 들쭉날쭉하면 컷 단위 판단을 믿지 않음
+_clip_roll_cache: Dict[Tuple[str, int, int], Optional[float]] = {}
+
+
+def estimate_clip_roll(
+    clip: HighlightClip,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[float]:
+    """
+    컷 구간 안의 프레임 5장으로 그 컷의 기울기를 추정합니다 (카메라가 주행 중 조금 돌아갔거나,
+    경사로·커브에서 차체가 기운 컷도 맞추기 위함). 컷 안에서는 각도를 하나로 고정해 화면이 흔들리지 않게 합니다.
+    프레임별 값이 일관되지 않거나 직선이 부족하면 None (영상 전체 추정값을 대신 사용).
+    """
+    key = (str(clip.video.path), int(round(clip.start_sec * 10)), int(round(clip.end_sec * 10)))
+    if key in _clip_roll_cache:
+        return _clip_roll_cache[key]
+    dur = max(0.2, clip.duration)
+    times = [clip.start_sec + dur * (0.1 + 0.8 * k / max(1, CLIP_ROLL_FRAMES - 1)) for k in range(CLIP_ROLL_FRAMES)]
+    frames = _grab_gray_frames(clip.video, times, cancel_check)
+    ests = [e for e, _n in (frame_roll_estimate(f) for f in frames if f is not None) if e is not None]
+    result: Optional[float] = None
+    if len(ests) >= 3:
+        med = float(np.median(ests))
+        spread = float(np.median(np.abs(np.array(ests) - med)))
+        if spread <= CLIP_ROLL_MAX_SPREAD:
+            result = float(np.clip(med, -ROLL_MAX_DEG, ROLL_MAX_DEG))
+    if not (cancel_check and cancel_check()):
+        _clip_roll_cache[key] = result
+    return result
 
 
 def estimate_roll_angle(
@@ -961,29 +1031,9 @@ def estimate_roll_angle(
             return float(d["angle"]), float(d["confidence"])
         except Exception:
             pass
-    sw = 640
-    sh = max(2, int(round(sw * max(1, video.height) / max(1, video.width) / 2)) * 2)
     dur = max(0.5, video.duration_sec)
     times = [dur * (0.05 + 0.9 * k / max(1, ROLL_SAMPLE_FRAMES - 1)) for k in range(ROLL_SAMPLE_FRAMES)]
-    ffmpeg = get_ffmpeg_exe()
-
-    def grab(t: float) -> Optional[np.ndarray]:
-        if cancel_check and cancel_check():
-            return None
-        try:
-            res = subprocess.run(
-                [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(video.path),
-                 "-frames:v", "1", "-vf", f"scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, creationflags=get_CreationFlags(),
-            )
-            if len(res.stdout) >= sw * sh:
-                return np.frombuffer(res.stdout[: sw * sh], dtype=np.uint8).reshape(sh, sw)
-        except Exception:
-            pass
-        return None
-
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        frames = list(pool.map(grab, times))
+    frames = _grab_gray_frames(video, times, cancel_check)
     ests = [e for e, _n in (frame_roll_estimate(f) for f in frames if f is not None) if e is not None]
     if len(ests) < 4:
         angle, conf = 0.0, 0.0
@@ -1352,25 +1402,34 @@ def render_highlight_shorts(
     done_dur = 0.0
     encode_share = 0.8 if use_xfade else 0.9
 
-    # 수평 자동 보정: 쇼츠에 쓰이는 영상마다 카메라 기울기 추정 (디스크 캐시)
-    level_by_video: Dict[int, float] = {}
+    # 수평 자동 보정: 컷마다 그 구간의 프레임으로 기울기를 추정하고, 불확실하면 영상 전체 추정값, 그것도 불확실하면 그대로
+    level_by_clip: List[float] = [0.0] * n
     if cfg.auto_level:
-        uniq: List[VideoFileInfo] = []
-        for c in use_clips:
-            if all(c.video is not u for u in uniq):
-                uniq.append(c.video)
-        for k, v in enumerate(uniq):
+        video_angle: Dict[int, Tuple[float, float]] = {}
+        for idx, c in enumerate(use_clips):
             if cancel_check and cancel_check():
                 raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
             if progress_callback:
-                progress_callback(0.0, f"수평(지평선) 기울기 확인 중 [{k + 1}/{len(uniq)}]: {v.filename}")
-            angle, conf = estimate_roll_angle(v, cancel_check)
-            level_by_video[id(v)] = angle
+                progress_callback(0.0, f"수평(지평선) 기울기 확인 중 [{idx + 1}/{n}]: {c.video.filename} {c.start_sec:.0f}초~")
+            cut_angle = estimate_clip_roll(c, cancel_check)
+            if cut_angle is not None:
+                angle, how = cut_angle, "컷 기준"
+            else:
+                if id(c.video) not in video_angle:
+                    video_angle[id(c.video)] = estimate_roll_angle(c.video, cancel_check)
+                v_angle, v_conf = video_angle[id(c.video)]
+                # 영상 전체 프레임이 거의 같은 각도로 일치할 때만 대신 사용 (카메라가 중간에 돌아간 영상이면 잘못 돌릴 수 있음)
+                angle, how = (v_angle, "영상 전체 기준") if v_conf >= VIDEO_ROLL_TRUST else (0.0, "판단 어려움")
+            level_by_clip[idx] = angle if abs(angle) >= ROLL_MIN_APPLY_DEG else 0.0
             if notes is not None:
-                if abs(angle) >= ROLL_MIN_APPLY_DEG:
-                    notes.append(f"수평 보정: {v.filename} {angle:+.1f}° 기울어짐 → 바로잡음")
-                elif conf < 0.4:
-                    notes.append(f"수평 보정: {v.filename} 직선이 부족해 판단하기 어려워 그대로 둠")
+                mm, ss = divmod(int(c.start_sec), 60)
+                where = f"컷 {idx + 1} ({c.video.filename} {mm}:{ss:02d})"
+                if how == "판단 어려움":
+                    notes.append(f"수평: {where} 직선이 부족해 그대로 둠")
+                elif abs(angle) >= ROLL_MIN_APPLY_DEG:
+                    notes.append(f"수평: {where} {angle:+.1f}° 보정 ({how})")
+        if notes is not None and not any(n_.startswith("수평:") for n_ in notes):
+            notes.append("수평: 모든 컷이 이미 수평이라 보정하지 않음")
 
     with tempfile.TemporaryDirectory(prefix="quick_dash_cam_shorts_") as tmp_str:
         tmp = Path(tmp_str)
@@ -1411,7 +1470,7 @@ def render_highlight_shorts(
                 fade_in=cfg.fade_sec if idx == 0 else 0.0,
                 fade_out=cfg.fade_sec if idx == n - 1 else 0.0,
                 overlay_window=(t_in + 0.15, seg_durs[idx] - t_out - 0.1),
-                level_deg=level_by_video.get(id(clip.video), 0.0),
+                level_deg=level_by_clip[idx],
             )
             ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra, **timing)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):
