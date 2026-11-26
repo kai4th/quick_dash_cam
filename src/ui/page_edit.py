@@ -29,6 +29,13 @@ REVIEW_FILTERS = ["전체 보기", "미검토만", "신호대기만", "단조 �
 
 
 class EditPage(ctk.CTkFrame):
+    SHORTCUTS = (
+        "재생·이동\n  Space  재생 / 일시정지\n  ← →  1초 이동   (Shift: 5초)\n\n"
+        "구간 편집\n  I / O  시작점 / 끝점 찍기\n  Del  선택 구간 삭제\n  Ctrl+Z  되돌리기\n\n"
+        "검출 구간 리뷰\n  1 / 2 / 3  스킵 유지 / 일반 복원 / 삭제\n  N / P  다음 / 이전 구간\n  R  다시 재생\n"
+        "  [ / ]  현재 위치를 구간 시작 / 끝으로\n\n"
+        "타임라인\n  + / -  확대 / 축소   0  전체 보기\n  마우스 휠 확대·축소 · Shift+휠 이동 · 우클릭 드래그 구간 선택"
+    )
     def __init__(self, master, app) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
@@ -55,6 +62,14 @@ class EditPage(ctk.CTkFrame):
         self.store.subscribe("videos", self._on_videos)
         self.store.subscribe("segments", self._on_segments)
         self.store.subscribe("busy", self._on_busy)
+        reg = app.settings
+        reg.register_var("edit.detect_stop", self.chk_stop, [True, False])
+        reg.register_var("edit.detect_straight", self.chk_straight, [True, False])
+        reg.register("edit.sensitivity", self.sens.get, lambda v: self.sens.set(min(90, max(10, float(v)))))
+        reg.register("edit.min_duration", self.mindur.get, lambda v: self.mindur.set(min(20, max(3, float(v)))))
+        reg.register_var("edit.padding", self.pad_var, PAD_OPTIONS)
+        reg.register_var("edit.gpu", self.gpu_var, [True, False])
+        reg.register_var("edit.review_autoplay", self.autoplay_var, [True, False])
         self._sync_config()
 
     # ── 화면 구성 ──
@@ -198,6 +213,9 @@ class EditPage(ctk.CTkFrame):
         self.btn_keep_all.grid(row=6, column=0, sticky="ew", pady=(6, 0))
 
     # ── 화면 전환 ──
+
+    def on_settings_loaded(self) -> None:
+        self._sync_config()
 
     def on_show(self) -> None:
         self.timeline.redraw()

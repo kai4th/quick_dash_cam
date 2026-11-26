@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 from typing import Callable, Dict, Optional
@@ -14,6 +15,7 @@ from typing import Callable, Dict, Optional
 import customtkinter as ctk
 
 from ..ffmpeg_utils import detect_best_gpu_decoder, detect_best_h264_encoder
+from . import persist
 from .media import ThumbnailLoader
 from .state import AppState
 from .theme import BG_APP, BG_PANEL, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, font, format_duration
@@ -45,6 +47,10 @@ class QuickDashCamApp(ctk.CTk):
 
         self.store = AppState()
         self.thumbs = ThumbnailLoader()
+        self.settings = persist.SettingsRegistry()
+        self._autosave_job: Optional[str] = None
+        self._restoring = False
+        self._resume_checked = False  # 시작 시 '이어하기' 확인 전에는 저장 파일을 건드리지 않음
         self.pages: Dict[str, ctk.CTkFrame] = {}
         self.current_page: Optional[str] = None
 
@@ -70,11 +76,21 @@ class QuickDashCamApp(ctk.CTk):
 
         self.store.subscribe("videos", self._update_summary)
         self.store.subscribe("segments", self._update_summary)
+        for topic in ("videos", "segments", "highlights"):
+            self.store.subscribe(topic, self._schedule_autosave)
         self.bind("<KeyPress>", self._on_key)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 지난번 설정 복원
+        self.settings.apply(persist.load_settings())
+        for page in self.pages.values():
+            if hasattr(page, "on_settings_loaded"):
+                page.on_settings_loaded()
+
         self.show_page("library")
         self._update_summary()
         self.after(300, self._detect_encoder_async)
+        self.after(500, self._offer_resume)
 
     # ── 상단 ──
 
@@ -93,7 +109,9 @@ class QuickDashCamApp(ctk.CTk):
         self.summary_label.grid(row=0, column=2, padx=10)
         self.encoder_badge = ctk.CTkLabel(header, text="⚡ 장치 확인 중…", font=font(11, True), fg_color="#1e293b",
                                           corner_radius=6, padx=8, pady=3)
-        self.encoder_badge.grid(row=0, column=3, padx=(4, 16))
+        self.encoder_badge.grid(row=0, column=3, padx=(4, 6))
+        ctk.CTkButton(header, text="⌨ 단축키 (F1)", width=110, height=30, font=font(12), fg_color=NEUTRAL,
+                      hover_color=NEUTRAL_HOVER, command=self.show_shortcuts).grid(row=0, column=4, padx=(0, 16))
 
     def _on_step_clicked(self, value: str) -> None:
         for key, title in PAGE_TITLES.items():
@@ -182,8 +200,17 @@ class QuickDashCamApp(ctk.CTk):
         self.set_status(title, 0.0)
         self.store.emit("busy")
 
+        t0 = time.monotonic()
+
         def report(frac: float, msg: str) -> None:
-            self.after(0, lambda f=frac, m=msg: self.set_status(m, f))
+            # 경과 시간과, 진행률이 어느 정도 쌓이면 남은 시간 추정치를 함께 표시
+            elapsed = time.monotonic() - t0
+            extra = ""
+            if elapsed >= 3.0:
+                extra = f"   ·   경과 {format_duration(elapsed)}"
+                if 0.05 <= frac < 0.999:
+                    extra += f" · 남은 약 {format_duration(elapsed * (1.0 - frac) / frac)}"
+            self.after(0, lambda f=frac, m=msg + extra: self.set_status(m, f))
 
         def cancelled() -> bool:
             return self.store.cancel_requested
@@ -242,7 +269,16 @@ class QuickDashCamApp(ctk.CTk):
 
     # ── 단축키 ──
 
+    def show_shortcuts(self) -> None:
+        page = self.pages.get(self.current_page or "")
+        title = PAGE_TITLES.get(self.current_page or "", "")
+        body = getattr(page, "SHORTCUTS", "이 화면에는 단축키가 없습니다.")
+        messagebox.showinfo(f"단축키 — {title}", body + "\n\n공통: F1 = 이 안내")
+
     def _on_key(self, event) -> None:
+        if event.keysym == "F1":
+            self.show_shortcuts()
+            return
         focus = self.focus_get()
         if isinstance(focus, (tk.Entry, tk.Text)):
             return
@@ -250,7 +286,107 @@ class QuickDashCamApp(ctk.CTk):
         if page is not None and hasattr(page, "handle_key"):
             page.handle_key(event)
 
+    # ── 작업 저장 · 이어하기 ──
+
+    def _schedule_autosave(self) -> None:
+        if self._restoring:
+            return
+        if self._autosave_job is not None:
+            try:
+                self.after_cancel(self._autosave_job)
+            except Exception:
+                pass
+        self._autosave_job = self.after(1500, self._autosave)
+
+    def _autosave(self) -> None:
+        self._autosave_job = None
+        if self.store.videos:
+            persist.save_session(self.store)
+        elif self._resume_checked:
+            persist.clear_session()  # 목록을 모두 비웠으면 다음 실행 때 이어하기를 묻지 않음
+
+    def _offer_resume(self) -> None:
+        if self.store.videos:
+            self._resume_checked = True
+            return
+        data = persist.load_session()
+        self._resume_checked = True
+        if data is None:
+            return
+        n_v, n_c = len(data.get("videos", [])), sum(1 for c in data.get("highlights", []) if c.get("included"))
+        when = str(data.get("saved_at", "")).replace("T", " ")
+        if not messagebox.askyesno(
+            "지난 작업 이어하기",
+            f"지난번 작업을 이어서 할까요?\n\n저장 시각: {when}\n영상 {n_v}개 · 쇼츠 컷 {n_c}개\n"
+            "(구간 편집·리뷰 결정·컷 맞춤이 그대로 복원됩니다)",
+        ):
+            # 실수로 '아니요'를 눌러도 되살릴 수 있게 지우지 않고 백업으로 옮김
+            try:
+                src = persist.config_dir() / "session.json"
+                src.replace(persist.config_dir() / "session.previous.json")
+            except OSError:
+                pass
+            return
+        self._restoring = True
+        try:
+            n, missing = persist.restore_session(self.store, data)
+            self.store.emit("videos", "segments", "highlights")
+        finally:
+            self._restoring = False
+        if missing:
+            messagebox.showwarning("일부 영상을 찾지 못함",
+                                   "다음 영상은 옮겨졌거나 지워져서 빼고 복원했습니다:\n\n" + "\n".join(missing[:15]))
+        self._load_caches_after_restore()
+        self.show_page("shorts" if self.store.highlight_clips else ("edit" if any(v.analyzed for v in self.store.videos) else "library"))
+        self.set_status(f"✅ 지난 작업을 이어서 열었습니다 — 영상 {n}개, 쇼츠 컷 {len(self.store.highlight_clips)}개", 1.0)
+
+    def _load_caches_after_restore(self) -> None:
+        from ..analyzer import load_cached_features
+        from ..highlights import _appear_cache_path, ensure_appearance
+
+        videos = list(self.store.videos)
+        cfg = self.store.analysis_config
+
+        def job(report, cancelled):
+            for i, v in enumerate(videos):
+                if cancelled():
+                    break
+                report((i + 1) / max(1, len(videos)), f"저장된 분석 결과 불러오는 중 ({i + 1}/{len(videos)}): {v.filename}")
+                load_cached_features(v, cfg.sample_fps)
+                cache = _appear_cache_path(v.path)
+                if v.feature_cache is not None and cache is not None and cache.exists():
+                    ensure_appearance(v)
+            return None
+
+        self.run_job("저장된 분석 결과 불러오는 중…", job, lambda _r: self.set_status("✅ 지난 작업을 이어서 열었습니다.", 1.0))
+
     def _on_close(self) -> None:
+        if self.store.busy:
+            if not messagebox.askyesno("작업 중", "작업이 진행 중입니다. 취소하고 종료할까요?"):
+                return
+            self.cancel_job()
+            self._close_when_idle(0)
+            return
+        self._shutdown()
+
+    def _close_when_idle(self, waited_ms: int) -> None:
+        # 진행 중인 FFmpeg가 정리될 때까지 잠시 기다린 뒤 종료 (최대 약 5초)
+        if self.store.busy and waited_ms < 5000:
+            self.after(100, lambda: self._close_when_idle(waited_ms + 100))
+            return
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        if self._autosave_job is not None:
+            try:
+                self.after_cancel(self._autosave_job)
+            except Exception:
+                pass
+        if self.store.videos:
+            persist.save_session(self.store)
+        elif self._resume_checked:
+            persist.clear_session()
+        persist.save_settings(self.settings.snapshot())
         for page in self.pages.values():
             if hasattr(page, "shutdown"):
                 try:

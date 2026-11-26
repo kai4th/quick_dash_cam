@@ -19,6 +19,7 @@ import numpy as np
 from ..ai_director import AiDirectorError, ai_select_highlights, find_claude_cli
 from ..analyzer import analyze_video
 from ..highlights import (
+    clip_timestamp_text,
     ensure_appearance,
     reframe_affine,
     reframe_geometry,
@@ -110,6 +111,11 @@ def compute_highlights(store, acfg, hcfg: HighlightConfig, mode: AiDirectorMode,
 
 
 class ShortsPage(ctk.CTkFrame):
+    SHORTCUTS = (
+        "컷\n  Space  이 컷 재생 / 멈춤\n  X  사용 / 제외\n  PgUp / PgDn  이전 / 다음 컷\n  , / .  컷을 0.5초 앞 / 뒤로\n\n"
+        "맞춤\n  ← →  기울기 0.1°   (Shift: 1°)\n  미리보기 클릭  소실점 지정\n\n"
+        "목록\n  ↑ ↓  컷 선택 · 더블클릭  사용 / 제외"
+    )
     def __init__(self, master, app) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
@@ -129,6 +135,7 @@ class ShortsPage(ctk.CTkFrame):
         self.store.subscribe("videos", self._on_videos)
         self.store.subscribe("highlights", self.refresh_list)
         self.store.subscribe("busy", self._on_busy)
+        self._register_settings()
         self.refresh_list()
 
     # ── 왼쪽: 장면 목록 ──
@@ -196,9 +203,21 @@ class ShortsPage(ctk.CTkFrame):
         ctk.CTkButton(r1, text="다음 컷 [PgDn] ▶", height=34, fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
                       command=lambda: self.step_cut(1)).grid(row=0, column=2, padx=(3, 0), sticky="ew")
 
-        # 2줄: 기울기
+        # 2줄: 컷 범위 (앞뒤로 옮기기 · 길이 조절)
+        rr = ctk.CTkFrame(ctl, fg_color="transparent")
+        rr.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        rr.grid_columnconfigure(5, weight=1)
+        ctk.CTkLabel(rr, text="컷 범위", font=font(13, True), anchor="w").grid(row=0, column=0, padx=(0, 6))
+        for col, (txt, cmd) in enumerate((("◀ 0.5초 [,]", lambda: self.shift_cut(-0.5)), ("0.5초 ▶ [.]", lambda: self.shift_cut(0.5)),
+                                          ("길이 −0.5초", lambda: self.resize_cut(-0.5)), ("길이 +0.5초", lambda: self.resize_cut(0.5))), start=1):
+            ctk.CTkButton(rr, text=txt, width=84, height=30, fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
+                          command=cmd).grid(row=0, column=col, padx=1)
+        self.range_label = ctk.CTkLabel(rr, text="", font=font(12), text_color=FG_SOFT, anchor="e")
+        self.range_label.grid(row=0, column=5, sticky="ew", padx=(6, 0))
+
+        # 3줄: 기울기
         r2 = ctk.CTkFrame(ctl, fg_color="transparent")
-        r2.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        r2.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
         r2.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(r2, text="기울기", font=font(13, True), anchor="w").grid(row=0, column=0, padx=(0, 6))
         for col, (txt, d) in ((1, ("↺1°", -1.0)), (2, ("↺.1°", -0.1))):
@@ -213,10 +232,12 @@ class ShortsPage(ctk.CTkFrame):
                           command=lambda d=d: self.rotate(d)).grid(row=0, column=col, padx=1)
         self.roll_value = ctk.CTkLabel(r2, text="+0.0°", font=font(18, True), text_color="#facc15", width=70)
         self.roll_value.grid(row=0, column=6, padx=(6, 0))
+        ctk.CTkButton(r2, text="전체 적용", width=72, height=30, fg_color="#1e293b", hover_color=NEUTRAL,
+                      border_width=1, border_color=NEUTRAL_HOVER, command=self.apply_roll_all).grid(row=0, column=7, padx=(4, 0))
 
-        # 3줄: 소실점
+        # 4줄: 소실점
         r3 = ctk.CTkFrame(ctl, fg_color="transparent")
-        r3.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
+        r3.grid(row=3, column=0, sticky="ew", padx=10, pady=4)
         r3.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(r3, text="소실점", font=font(13, True), anchor="w").grid(row=0, column=0, padx=(0, 6))
         self.vp_label = ctk.CTkLabel(r3, text="", font=font(12), anchor="w")
@@ -226,9 +247,12 @@ class ShortsPage(ctk.CTkFrame):
         ctk.CTkButton(r3, text="이 컷 초기화", width=96, height=30, fg_color="#1e293b", hover_color=NEUTRAL,
                       border_width=1, border_color=NEUTRAL_HOVER, command=self.reset_adjust).grid(row=0, column=3, padx=2)
 
-        # 4줄: 보기 옵션 · 확대 정보
+        # 5줄: 보기 옵션 · 확대 정보
         r4 = ctk.CTkFrame(ctl, fg_color="transparent")
-        r4.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 2))
+        r4.grid(row=4, column=0, sticky="ew", padx=10, pady=(4, 2))
+        self.output_preview_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(r4, text="📱 결과 화면 미리보기", variable=self.output_preview_var, command=self.player.redraw,
+                        checkbox_width=18, checkbox_height=18).pack(side="left", padx=(0, 10))
         self.show_result_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(r4, text="맞춤 결과 보기", variable=self.show_result_var, command=self.player.redraw,
                         checkbox_width=18, checkbox_height=18).pack(side="left", padx=(0, 10))
@@ -238,7 +262,7 @@ class ShortsPage(ctk.CTkFrame):
         self.zoom_label = ctk.CTkLabel(r4, text="", font=font(12), text_color=FG_MUTED, anchor="e")
         self.zoom_label.pack(side="right")
         ctk.CTkLabel(ctl, text="💡 화면 클릭 = 소실점(도로가 모이는 곳) · 하늘색 원 = 모든 컷이 맞춰질 위치 · ← → 기울기",
-                     font=font(11), text_color=FG_MUTED, anchor="w").grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 8))
+                     font=font(11), text_color=FG_MUTED, anchor="w").grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 8))
 
     # ── 오른쪽: 설정 + 만들기 ──
 
@@ -272,7 +296,7 @@ class ShortsPage(ctk.CTkFrame):
         s2 = Section(scroll, "화면")
         s2.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         field_label(s2.body, "레이아웃", 0)
-        self.layout_var = menu(s2.body, LAYOUTS, "세로 9:16 · 흐림 배경", 1)
+        self.layout_var = menu(s2.body, LAYOUTS, "세로 9:16 · 흐림 배경", 1, cmd=self.player.redraw)
         field_label(s2.body, "해상도", 2, 0, 1)
         field_label(s2.body, "프레임레이트", 2, 1, 1)
         self.res_var = menu(s2.body, RESOLUTIONS, "자동 (원본 화질)", 3, 0, 1)
@@ -290,10 +314,12 @@ class ShortsPage(ctk.CTkFrame):
         self.title_entry = ctk.CTkEntry(s3.body, height=32, placeholder_text="예: 가을 산길 드라이브")
         self.title_entry.grid(row=1, column=0, columnspan=2, sticky="ew")
         stylize_entry_isolation(self.title_entry)
+        self.title_entry.bind("<KeyRelease>", lambda _e: self.output_preview_var.get() and self.player.redraw())
         self.caption_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(s3.body, text="AI 장면 자막 (작게, 왼쪽 아래)", variable=self.caption_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ctk.CTkCheckBox(s3.body, text="AI 장면 자막 (작게, 왼쪽 아래)", variable=self.caption_var,
+                        command=self.player.redraw).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.ts_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(s3.body, text="촬영 시각 표시", variable=self.ts_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ctk.CTkCheckBox(s3.body, text="촬영 시각 표시", variable=self.ts_var, command=self.player.redraw).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         s4 = Section(scroll, "소리", opened=False)
         s4.grid(row=3, column=0, sticky="ew", pady=(0, 6))
@@ -317,6 +343,34 @@ class ShortsPage(ctk.CTkFrame):
         self.btn_make = ctk.CTkButton(bottom, text="🎬 쇼츠 만들기 (MP4)", height=48, font=font(16, True),
                                       fg_color=SHORTS, hover_color=SHORTS_HOVER, command=self.make_shorts)
         self.btn_make.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+    def _register_settings(self) -> None:
+        reg = self.app.settings
+        for key, var, allowed in (
+            ("shorts.ai", self.ai_var, list(AI_MODES)), ("shorts.length", self.len_var, list(LENGTHS)),
+            ("shorts.clip", self.clip_var, list(CLIP_LENGTHS)), ("shorts.layout", self.layout_var, list(LAYOUTS)),
+            ("shorts.resolution", self.res_var, list(RESOLUTIONS)), ("shorts.fps", self.fps_var, list(FPS)),
+            ("shorts.quality", self.quality_var, list(QUALITY)), ("shorts.audio", self.audio_var, list(AUDIO)),
+            ("shorts.transition", self.trans_var, list(TRANSITIONS)), ("shorts.transition_len", self.trans_len_var, list(TRANS_LENGTHS)),
+        ):
+            reg.register_var(key, var, allowed)
+        for key, var in (("shorts.hw", self.hw_var), ("shorts.auto_level", self.auto_level_var),
+                         ("shorts.captions", self.caption_var), ("shorts.timestamp", self.ts_var),
+                         ("shorts.show_result", self.show_result_var), ("shorts.grid", self.grid_var),
+                         ("shorts.output_preview", self.output_preview_var)):
+            reg.register_var(key, var, [True, False])
+
+        def set_title(v):
+            if v:  # 빈 값이면 건드리지 않아야 안내 문구(placeholder)가 유지됨
+                self.title_entry.delete(0, "end")
+                self.title_entry.insert(0, str(v))
+        reg.register("shorts.title", lambda: self.title_entry.get(), set_title)
+
+        def set_bgm(v):
+            if v and Path(v).exists():
+                self.bgm_path = Path(v)
+                self.bgm_label.configure(text=f"🎵 {self.bgm_path.name}", text_color="#f9a8d4")
+        reg.register("shorts.bgm", lambda: str(self.bgm_path) if self.bgm_path else "", set_bgm)
 
     # ── 화면 전환 ──
 
@@ -492,18 +546,100 @@ class ShortsPage(ctk.CTkFrame):
         return c
 
     def _transform_frame(self, arr: np.ndarray) -> np.ndarray:
+        self._out_geom = None
         c = self._cut_on_screen()
-        if c is None or not self.show_result_var.get():
+        if c is None:
             return arr
-        roll, target = c.roll_adjust or 0.0, self._target()
-        if abs(roll) < 0.05 and (c.vp is None or target is None):
-            return arr
+        output_mode = bool(self.output_preview_var.get())
+        if self.show_result_var.get() or output_mode:
+            roll, target = c.roll_adjust or 0.0, self._target()
+            if abs(roll) >= 0.05 or (c.vp is not None and target is not None):
+                h, w = arr.shape[:2]
+                arr = cv2.warpAffine(arr, reframe_affine(w, h, roll, c.vp, target), (w, h), flags=cv2.INTER_LINEAR)
+        if output_mode:
+            arr = self._compose_output(arr)
+        return arr
+
+    def _compose_output(self, arr: np.ndarray) -> np.ndarray:
+        """현재 레이아웃 설정대로 실제 결과 화면(세로 9:16 흐림 배경 / 꽉 채우기 / 가로)을 합성해 미리 보여줌."""
+        layout = LAYOUTS[self.layout_var.get()]
         h, w = arr.shape[:2]
-        return cv2.warpAffine(arr, reframe_affine(w, h, roll, c.vp, target), (w, h), flags=cv2.INTER_LINEAR)
+        if layout == ShortsLayout.LANDSCAPE:
+            self._out_geom = {"layout": layout, "w": w, "h": h, "fg_h": h, "band": 0.0}
+            return arr
+        oh = max(160, self.player.canvas.winfo_height() - 8)
+        ow = int(round(oh * 9 / 16))
+        avail = max(90, self.player.canvas.winfo_width() - 8)
+        if ow > avail:
+            ow, oh = avail, int(round(avail * 16 / 9))
+        if layout == ShortsLayout.VERTICAL_CROP:
+            scale = max(ow / w, oh / h)
+            big = cv2.resize(arr, (int(w * scale) + 2, int(h * scale) + 2), interpolation=cv2.INTER_LINEAR)
+            y0, x0 = (big.shape[0] - oh) // 2, (big.shape[1] - ow) // 2
+            out = np.ascontiguousarray(big[y0:y0 + oh, x0:x0 + ow])
+            self._out_geom = {"layout": layout, "w": ow, "h": oh, "fg_h": oh, "band": 0.0}
+            return out
+        # 흐림 배경: 화면을 꽉 채우게 키워 흐리고 어둡게 한 위에, 원본 화면을 폭에 맞춰 가운데 배치
+        sw, sh = max(2, ow // 4), max(2, oh // 4)
+        scale = max(sw / w, sh / h)
+        small = cv2.resize(arr, (int(w * scale) + 2, int(h * scale) + 2), interpolation=cv2.INTER_AREA)
+        y0, x0 = (small.shape[0] - sh) // 2, (small.shape[1] - sw) // 2
+        bg = cv2.GaussianBlur(small[y0:y0 + sh, x0:x0 + sw], (0, 0), 4)
+        out = (cv2.resize(bg, (ow, oh), interpolation=cv2.INTER_LINEAR).astype(np.float32) * 0.82).astype(np.uint8)
+        fh = min(oh, int(round(h * ow / w)))
+        fg = cv2.resize(arr, (ow, fh), interpolation=cv2.INTER_AREA)
+        fy = (oh - fh) // 2
+        out[fy:fy + fh, :] = fg
+        self._out_geom = {"layout": layout, "w": ow, "h": oh, "fg_h": fh, "band": (oh - fh) / 2.0}
+        return np.ascontiguousarray(out)
+
+    def _draw_output_texts(self, cv: tk.Canvas, c: HighlightClip, x0: int, y0: int, w: int, h: int) -> None:
+        """렌더러와 같은 비율 위치에 제목·자막·촬영 시각을 미리 표시."""
+        geom = getattr(self, "_out_geom", None) or {}
+        layout = geom.get("layout", LAYOUTS[self.layout_var.get()])
+        vertical = layout != ShortsLayout.LANDSCAPE
+        band = float(geom.get("band", 0.0))
+        fg_h = float(geom.get("fg_h", h))
+        use_band = layout == ShortsLayout.VERTICAL_BLUR and band >= h * 0.12
+
+        def units(t: str) -> float:
+            return sum(1.0 if ord(ch) >= 0x2E80 else 0.6 for ch in t) or 1.0
+
+        def text(xc, y, t, size, anchor="n", shadow=True, color="white"):
+            if shadow:
+                cv.create_text(xc + 2, y + 2, text=t, anchor=anchor, fill="black", font=("Malgun Gothic", -size, "bold"))
+            cv.create_text(xc, y, text=t, anchor=anchor, fill=color, font=("Malgun Gothic", -size, "bold"))
+
+        title = self.title_entry.get().strip()
+        if title:
+            fs = int(max(9, min(w * (0.075 if vertical else 0.042), 0.88 * w / units(title))))
+            ty = max(h * 0.04, band * 0.5 - fs * 0.6) if use_band else h * 0.06
+            text(x0 + w / 2, y0 + ty, title, fs)
+        if self.caption_var.get() and c.caption:
+            fs = int(max(8, w * (0.036 if vertical else 0.020)))
+            bottom = (h + fg_h) / 2.0 if layout == ShortsLayout.VERTICAL_BLUR else h * (0.86 if vertical else 0.88)
+            text(x0 + w * 0.05, y0 + bottom - fs - h * (0.018 if vertical else 0.03), c.caption, fs, anchor="nw", color="#f1f5f9")
+        if self.ts_var.get():
+            ts = clip_timestamp_text(c)
+            if ts:
+                fs = int(max(8, w * (0.042 if vertical else 0.022)))
+                yy = h - band + band * 0.25 if use_band else h * 0.90
+                text(x0 + w / 2, y0 + yy, ts, fs)
 
     def _draw_overlay(self, cv: tk.Canvas, x0: int, y0: int, w: int, h: int) -> None:
         c = self._cut_on_screen()
         if c is None:
+            return
+        if self.output_preview_var.get():
+            self._draw_output_texts(cv, c, x0, y0, w, h)
+            label = {ShortsLayout.VERTICAL_BLUR: "세로 9:16 · 흐림 배경", ShortsLayout.VERTICAL_CROP: "세로 9:16 · 꽉 채우기",
+                     ShortsLayout.LANDSCAPE: "가로 16:9"}[LAYOUTS[self.layout_var.get()]]
+            t_id = cv.create_text(x0 + 12, y0 + 18, text=f"📱 결과 화면 · {label}", anchor="w", fill="#f9a8d4",
+                                  font=("Malgun Gothic", 10, "bold"))
+            bx = cv.bbox(t_id)
+            if bx:
+                bg = cv.create_rectangle(bx[0] - 6, bx[1] - 4, bx[2] + 6, bx[3] + 4, fill="#0f172a", outline="")
+                cv.tag_lower(bg, t_id)
             return
         if self.grid_var.get():
             for k in range(1, 12):
@@ -534,6 +670,9 @@ class ShortsPage(ctk.CTkFrame):
     def _on_player_click(self, qx: float, qy: float, w: int, h: int) -> None:
         c = self._cut_on_screen()
         if c is None:
+            return
+        if self.output_preview_var.get():
+            self.app.set_status("📍 소실점은 '결과 화면 미리보기'를 끄고 맞춤 화면에서 클릭해 지정하세요.")
             return
         if self.show_result_var.get():
             sx, sy = reframe_inverse_point(w, h, c.roll_adjust or 0.0, c.vp, self._target(), qx, qy)
@@ -571,6 +710,55 @@ class ShortsPage(ctk.CTkFrame):
             c.roll_adjust = None
             self._after_adjust()
 
+    def shift_cut(self, delta: float) -> None:
+        """컷을 앞뒤로 옮김 (길이 유지, 영상 범위 안에서)."""
+        c = self.selected()
+        if c is None:
+            return
+        dur = c.duration
+        start = min(max(0.0, c.start_sec + delta), max(0.0, c.video.duration_sec - dur))
+        if abs(start - c.start_sec) < 1e-3:
+            return
+        c.start_sec, c.end_sec = start, start + dur
+        self._after_trim()
+
+    def resize_cut(self, delta: float) -> None:
+        """컷 길이를 늘이거나 줄임 (1~8초, 시작점 고정)."""
+        c = self.selected()
+        if c is None:
+            return
+        end = min(c.video.duration_sec, c.start_sec + min(8.0, max(1.0, c.duration + delta)))
+        if end - c.start_sec < 1.0 - 1e-6 or abs(end - c.end_sec) < 1e-3:
+            return
+        c.end_sec = end
+        self._after_trim()
+
+    def _after_trim(self) -> None:
+        c = self.selected()
+        g = self.store.highlight_global(c) if c is not None else None
+        if g is not None:
+            self.player.stop()
+            self.player.seek((g[0] + g[1]) / 2)
+        self.store.emit("highlights")
+
+    def apply_roll_all(self) -> None:
+        c = self.selected()
+        if c is None:
+            return
+        roll = c.roll_adjust or 0.0
+        others = [x for x in self.store.highlight_clips if x.included and x is not c]
+        if not others:
+            return
+        differing = [x for x in others if x.roll_adjust not in (None, roll) and abs((x.roll_adjust or 0.0) - roll) > 0.05]
+        if differing and not messagebox.askyesno(
+                "기울기 전체 적용", f"사용 중인 다른 컷 {len(others)}개의 기울기를 모두 {roll:+.1f}°로 바꿀까요?\n"
+                                   f"(따로 맞춰 둔 컷 {len(differing)}개도 바뀝니다)"):
+            return
+        for x in others:
+            x.roll_adjust = roll
+        self.app.set_status(f"↻ 사용 중인 컷 {len(others) + 1}개 모두 기울기 {roll:+.1f}°로 맞췄습니다.")
+        self.store.emit("highlights")
+
     def _after_adjust(self) -> None:
         c = self.selected()
         g = self.store.highlight_global(c) if c is not None else None
@@ -589,6 +777,7 @@ class ShortsPage(ctk.CTkFrame):
             self.roll_value.configure(text="+0.0°")
             self.vp_label.configure(text="-")
             self.zoom_label.configure(text="")
+            self.range_label.configure(text="")
             return
         used = [i for i, x in enumerate(self.store.highlight_clips) if x.included]
         pos = f"사용 컷 {used.index(self.index) + 1}/{len(used)}" if self.index in used else "제외된 후보"
@@ -597,6 +786,7 @@ class ShortsPage(ctk.CTkFrame):
                                       f"{' · ' + c.reason if c.reason else ''}")
         roll = c.roll_adjust or 0.0
         self.roll_value.configure(text=f"{roll:+.1f}°")
+        self.range_label.configure(text=f"{format_duration(c.start_sec, True)} ~ {format_duration(c.end_sec, True)}  ({c.duration:.1f}초)")
         target = self._target()
         self.vp_label.configure(text=("✔ 지정됨" if c.vp is not None else "✕ 미지정 — 화면을 클릭해 지정"),
                                 text_color="#4ade80" if c.vp is not None else "#f87171")
@@ -776,6 +966,10 @@ class ShortsPage(ctk.CTkFrame):
             self.toggle_use()
         elif k in ("Left", "Right"):
             self.rotate((-1 if k == "Left" else 1) * (1.0 if shift else 0.1))
+        elif k == "comma":
+            self.shift_cut(-0.5)
+        elif k == "period":
+            self.shift_cut(0.5)
         elif k == "Prior":
             self.step_cut(-1)
         elif k == "Next":

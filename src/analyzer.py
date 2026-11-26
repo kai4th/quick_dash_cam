@@ -417,6 +417,31 @@ def reclassify_from_cache(
     )
 
 
+def load_cached_features(video_info: VideoFileInfo, sample_fps: float = AnalysisConfig().sample_fps) -> bool:
+    """
+    디스크에 저장된 분석 특징 캐시만 불러와 feature_cache에 넣습니다 (구간은 바꾸지 않음).
+    저장된 작업을 이어서 열 때, 다시 분석하지 않고 민감도 조정·하이라이트 찾기를 바로 쓰기 위함.
+    """
+    if video_info.feature_cache is not None:
+        return True
+    sample_fps = max(1.0, min(10.0, sample_fps))
+    disk_cache = _get_disk_cache_path(video_info.path, sample_fps)
+    if disk_cache is None or not disk_cache.exists():
+        return False
+    try:
+        with np.load(disk_cache) as data:
+            video_info.feature_cache = {
+                "timestamps": data["timestamps"],
+                "motion": data["motion"],
+                "signed_dx": data["signed_dx"],
+                "scene": data["scene"],
+                "sample_fps": sample_fps,
+            }
+        return True
+    except Exception:
+        return False
+
+
 def analyze_video(
     video_info: VideoFileInfo,
     config: AnalysisConfig,

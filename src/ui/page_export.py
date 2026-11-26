@@ -53,6 +53,16 @@ class ExportPage(ctk.CTkFrame):
         self.store.subscribe("videos", self.refresh)
         self.store.subscribe("segments", self.refresh)
         self.store.subscribe("busy", self._on_busy)
+        reg = app.settings
+        reg.register_var("export.skip", self.skip_var, ["배속 재생 (타임랩스)", "완전히 잘라내기 (점프컷)"])
+        reg.register_var("export.speed", self.speed_var, SPEEDS)
+        reg.register_var("export.badge", self.badge_var, [True, False])
+        reg.register_var("export.quality", self.quality_var, list(QUALITY))
+        reg.register_var("export.resolution", self.res_var, list(RESOLUTION))
+        reg.register_var("export.fps", self.fps_var, list(FPS))
+        reg.register_var("export.codec", self.codec_var, list(CODEC))
+        reg.register_var("export.hw", self.hw_var, [True, False])
+        reg.register_var("export.audio", self.audio_var, list(AUDIO))
         self.refresh()
 
     def _menu(self, parent, values, row, default, col=0, colspan=2):
@@ -157,6 +167,9 @@ class ExportPage(ctk.CTkFrame):
         self.btn_start.configure(state="disabled" if self.store.busy or not self.store.videos else "normal")
 
     def on_show(self) -> None:
+        self.refresh()
+
+    def on_settings_loaded(self) -> None:
         self.refresh()
 
     # ── 실행 ──

@@ -28,6 +28,7 @@ def _thumb_time(v: VideoFileInfo) -> float:
 
 
 class LibraryPage(ctk.CTkFrame):
+    SHORTCUTS = "Del  선택한 영상을 목록에서 제외\n↑ ↓  목록에서 영상 선택"
     def __init__(self, master, app) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
@@ -35,6 +36,7 @@ class LibraryPage(ctk.CTkFrame):
         self._thumb_photos: Dict[str, tk.PhotoImage] = {}
         self._detail_photo: Optional[tk.PhotoImage] = None
         self._selected: Optional[int] = None
+        self.last_dir: str = ""
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -43,6 +45,8 @@ class LibraryPage(ctk.CTkFrame):
         self.store.subscribe("videos", self.refresh)
         self.store.subscribe("segments", self.refresh)
         self.store.subscribe("busy", self._on_busy)
+        app.settings.register_var("library.sort", self.sort_var, list(SORT_LABELS))
+        app.settings.register("library.last_dir", lambda: self.last_dir, lambda v: setattr(self, "last_dir", str(v)))
         self.refresh()
 
     # ── 화면 구성 ──
@@ -224,9 +228,10 @@ class LibraryPage(ctk.CTkFrame):
     def add_folder(self) -> None:
         if self.store.busy:
             return
-        folder = filedialog.askdirectory(title="주행 영상이 들어 있는 폴더 선택")
+        folder = filedialog.askdirectory(title="주행 영상이 들어 있는 폴더 선택", initialdir=self.last_dir or None)
         if not folder:
             return
+        self.last_dir = folder
         paths = scan_folder_for_videos(folder, recursive=False)
         if not paths:
             messagebox.showinfo("알림", "선택한 폴더에서 영상 파일을 찾지 못했습니다.")
@@ -237,8 +242,10 @@ class LibraryPage(ctk.CTkFrame):
         if self.store.busy:
             return
         exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS)) + " " + " ".join(f"*{e.upper()}" for e in sorted(VIDEO_EXTENSIONS))
-        files = filedialog.askopenfilenames(title="주행 영상 파일 선택", filetypes=[("영상 파일", exts), ("모든 파일", "*.*")])
+        files = filedialog.askopenfilenames(title="주행 영상 파일 선택", initialdir=self.last_dir or None,
+                                            filetypes=[("영상 파일", exts), ("모든 파일", "*.*")])
         if files:
+            self.last_dir = str(Path(files[0]).parent)
             self.load_paths([Path(f) for f in files])
 
     def load_paths(self, paths: List[Path]) -> None:
@@ -311,6 +318,9 @@ class LibraryPage(ctk.CTkFrame):
         self.store.clear_undo()
         self.store.emit("videos", "highlights")
         self.app.set_status("목록을 비웠습니다.", 0.0)
+
+    def on_settings_loaded(self) -> None:
+        self.store.sort_mode = SORT_LABELS.get(self.sort_var.get(), SortMode.CHRONOLOGICAL)
 
     def handle_key(self, event) -> None:
         if event.keysym == "Delete":
