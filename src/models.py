@@ -296,6 +296,12 @@ class ShortsLayout(str, Enum):
     LANDSCAPE = "landscape"          # 가로 16:9 — 원본 비율 유지
 
 
+class AiDirectorMode(str, Enum):
+    OFF = "off"                  # 알고리즘 점수만으로 장면 선정
+    CLAUDE_CODE = "claude_code"  # 설치된 Claude Code CLI(구독 계정)로 장면 선정
+    CLAUDE_API = "claude_api"    # Claude API(API 키, 사용량 과금)로 장면 선정
+
+
 class ShortsAudioMode(str, Enum):
     ORIGINAL = "original"  # 원본 주행 소리
     BGM = "bgm"            # 배경음악으로 교체
@@ -310,8 +316,10 @@ class HighlightClip:
     start_sec: float
     end_sec: float
     score: float = 0.0
-    reason: str = ""        # 선정 이유 (예: "회전·커브", "돌발 장면")
+    reason: str = ""        # 선정 이유 (예: "회전·커브", "돌발 장면") — AI 선정 시 AI가 쓴 장면 설명
     included: bool = True   # 사용자가 목록에서 제외하면 False
+    ai_score: Optional[float] = None  # Claude가 매긴 점수 (0~10), AI 선정을 쓰지 않으면 None
+    caption: str = ""       # Claude가 제안한 장면 자막 (쇼츠 화면에 표시 가능)
 
     @property
     def duration(self) -> float:
@@ -338,5 +346,6 @@ class ShortsExportConfig:
     fade_sec: float = 0.25                # 장면 전환 페이드 길이
     title_text: str = ""                  # 화면 상단 제목 (빈 문자열이면 표시 안 함)
     show_timestamp: bool = True           # 장면별 촬영 시각 표시
+    show_captions: bool = False           # AI가 제안한 장면 자막 표시
     quality_preset: VideoQualityPreset = VideoQualityPreset.HIGH
     use_hw_accel: bool = True

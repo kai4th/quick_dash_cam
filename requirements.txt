@@ -3,3 +3,4 @@ numpy>=2.0.0
 imageio-ffmpeg>=0.5.1
 customtkinter>=5.2.2
 pillow>=10.0.0
+anthropic>=2.14.0

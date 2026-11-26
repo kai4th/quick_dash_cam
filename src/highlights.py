@@ -536,6 +536,8 @@ def _build_clip_filtergraph(
     ts_file: Optional[Path],
     font_title: Optional[str],
     font_ts: Optional[str],
+    caption_file: Optional[Path] = None,
+    font_caption: Optional[str] = None,
 ) -> str:
     v = clip.video
     if cfg.layout == ShortsLayout.VERTICAL_BLUR:
@@ -573,10 +575,20 @@ def _build_clip_filtergraph(
             y = f"{out_h * 0.06:.0f}"
         graph += "," + _drawtext(font_title, title_file, fs, y, boxed=not use_band)
 
+    has_caption = caption_file is not None and bool(font_caption) and bool(clip.caption.strip())
+    if has_caption:
+        base_fs = out_w * (0.065 if vertical else 0.036)
+        fs = int(max(16, min(base_fs, 0.88 * out_w / _text_units(clip.caption.strip()))))
+        if use_band:
+            y = f"{out_h - band + band * 0.14:.0f}"
+        else:
+            y = f"{out_h * 0.78:.0f}"
+        graph += "," + _drawtext(font_caption, caption_file, fs, y, boxed=not use_band)  # type: ignore[arg-type]
+
     if ts_file is not None and font_ts:
         fs = int(max(14, out_w * (0.042 if vertical else 0.022)))
         if use_band:
-            y = f"{out_h - band + band * 0.25:.0f}"
+            y = f"{out_h - band + band * (0.50 if has_caption else 0.25):.0f}"
         else:
             y = f"{out_h * 0.90:.0f}"
         graph += "," + _drawtext(font_ts, ts_file, fs, y, boxed=not use_band)
@@ -632,10 +644,13 @@ def _encode_highlight_clip(
     font_title: Optional[str],
     font_ts: Optional[str],
     cancel_check: Optional[Callable[[], bool]],
+    caption_file: Optional[Path] = None,
+    font_caption: Optional[str] = None,
 ) -> Tuple[bool, str]:
     dur = clip.duration
     graph = _build_clip_filtergraph(
         clip, cfg, out_w, out_h, dur, title_file, cfg.title_text.strip(), ts_file, font_title, font_ts,
+        caption_file, font_caption,
     )
     cmd: List[str] = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -745,6 +760,10 @@ def render_highlight_shorts(
     title = cfg.title_text.strip()
     font_title = _find_overlay_font(need_cjk=any(ord(ch) >= 0x2E80 for ch in title)) if title else None
     font_ts = _find_overlay_font(need_cjk=False) if cfg.show_timestamp else None
+    font_caption = (
+        _find_overlay_font(need_cjk=True)
+        if cfg.show_captions and any(c.caption.strip() for c in use_clips) else None
+    )
 
     output_path = Path(cfg.output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -775,9 +794,14 @@ def render_highlight_shorts(
                 ts_file = tmp / f"ts_{idx:04d}.txt"
                 ts_file.write_text(ts_text, encoding="utf-8")
 
+            caption_file: Optional[Path] = None
+            if font_caption and clip.caption.strip():
+                caption_file = tmp / f"cap_{idx:04d}.txt"
+                caption_file.write_text(clip.caption.strip(), encoding="utf-8")
+
             seg_path = tmp / f"hl_{idx:04d}.ts"
             args = (ffmpeg, clip, cfg, seg_path, out_w, out_h)
-            extra = (clip_audio, title_file, ts_file, font_title, font_ts, cancel_check)
+            extra = (clip_audio, title_file, ts_file, font_title, font_ts, cancel_check, caption_file, font_caption)
             ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):
                 # 하드웨어 인코더 실패 시 소프트웨어 인코더로 자동 폴백

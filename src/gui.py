@@ -10,13 +10,14 @@ import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 import cv2
 import numpy as np
 
+from .ai_director import AiDirectorError, ai_select_highlights, find_claude_cli
 from .analyzer import analyze_video, reclassify_from_cache
 from .highlights import ensure_audio_levels, render_highlight_shorts, select_highlights
 from .ffmpeg_utils import (
@@ -28,6 +29,7 @@ from .ffmpeg_utils import (
     probe_video_file,
 )
 from .models import (
+    AiDirectorMode,
     AnalysisConfig,
     AudioMode,
     ExportConfig,
@@ -1010,6 +1012,8 @@ class QuickDashCamApp(ctk.CTk):
         self.highlight_index: Optional[int] = None
         self.shorts_bgm_path: Optional[Path] = None
         self._hl_play_queue: List[int] = []
+        self._anthropic_api_key: Optional[str] = None  # 이번 실행 동안만 메모리에 보관 (디스크 저장 안 함)
+        self._ai_consent_given: bool = False
 
         self._preview_worker = PreviewFrameWorker(self._on_worker_frame_ready)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2714,6 +2718,7 @@ class QuickDashCamApp(ctk.CTk):
 
         opts = ctk.CTkFrame(parent, fg_color="#0f172a", corner_radius=6)
         opts.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        self.shorts_opts_frame = opts
 
         row1 = ctk.CTkFrame(opts, fg_color="transparent")
         row1.pack(fill="x", padx=6, pady=(4, 1))
@@ -2779,9 +2784,29 @@ class QuickDashCamApp(ctk.CTk):
             top_tag = str(inner.winfo_toplevel())
             inner.bindtags(tuple(t for t in inner.bindtags() if t != top_tag))
 
+        row4 = ctk.CTkFrame(opts, fg_color="transparent")
+        row4.pack(fill="x", padx=6, pady=(0, 4))
+        ctk.CTkLabel(row4, text="장면 선정", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_ai_var = ctk.StringVar(value="Claude Code (구독 계정)")
+        ctk.CTkOptionMenu(
+            row4, values=["알고리즘 (빠름·오프라인)", "Claude Code (구독 계정)", "Claude API (API 키)"],
+            variable=self.shorts_ai_var, width=170, height=24, font=small,
+            command=lambda _v: self._shorts_settings_changed(),
+        ).pack(side="left", padx=(0, 8))
+        self.shorts_caption_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row4, text="AI 장면 자막 표시", variable=self.shorts_caption_var, font=ctk.CTkFont(size=10),
+            checkbox_width=16, checkbox_height=16,
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(
+            row4, text="🤖 AI: 후보를 넉넉히 뽑아 Claude가 사진을 보고 최종 장면·제목·자막을 정합니다",
+            font=ctk.CTkFont(size=10), text_color="#94a3b8",
+        ).pack(side="left")
+
         actions = ctk.CTkFrame(parent, fg_color="transparent")
         actions.grid(row=1, column=0, sticky="ew", pady=(1, 2))
         action_specs = [
+            ("⚙ 옵션 접기", self._shorts_toggle_options, "#1e293b", "#334155", 1),
             ("✨ 하이라이트 찾기", self._on_find_highlights, "#7c3aed", "#6d28d9", 3),
             ("▶ 전체 미리보기", self._shorts_preview_all, "#0284c7", "#0369a1", 2),
             ("⊘ 포함/제외 [X]", self._shorts_toggle_selected, "#334155", "#475569", 2),
@@ -2798,11 +2823,13 @@ class QuickDashCamApp(ctk.CTk):
                 self.btn_find_highlights = btn
             elif cmd == self._on_make_shorts:
                 self.btn_make_shorts = btn
+            elif cmd == self._shorts_toggle_options:
+                self.btn_shorts_opts = btn
 
         self.shorts_info_label = ctk.CTkLabel(
             actions, text="", font=ctk.CTkFont(size=11), text_color="#cbd5e1", anchor="w",
         )
-        self.shorts_info_label.grid(row=1, column=0, columnspan=4, sticky="ew", padx=2, pady=(2, 0))
+        self.shorts_info_label.grid(row=1, column=0, columnspan=5, sticky="ew", padx=2, pady=(2, 0))
 
         tree_box = ctk.CTkFrame(parent, fg_color="#1e293b", corner_radius=6)
         tree_box.grid(row=2, column=0, sticky="nsew")
@@ -2810,7 +2837,7 @@ class QuickDashCamApp(ctk.CTk):
         tree_box.grid_rowconfigure(0, weight=1)
 
         scaling = ctk.ScalingTracker.get_widget_scaling(self)
-        columns = ("no", "use", "start", "dur", "clip", "reason", "score")
+        columns = ("no", "use", "start", "dur", "clip", "reason", "caption", "score")
         self.shorts_tree = ttk.Treeview(
             tree_box, columns=columns, show="headings", height=4,
             style="Review.Treeview", selectmode="browse",
@@ -2821,7 +2848,8 @@ class QuickDashCamApp(ctk.CTk):
             ("start", "위치", 80, "center"),
             ("dur", "길이", 54, "e"),
             ("clip", "클립", 48, "center"),
-            ("reason", "선정 이유", 100, "w"),
+            ("reason", "장면 설명", 120, "w"),
+            ("caption", "자막", 100, "w"),
             ("score", "점수", 110, "w"),
         ]:
             self.shorts_tree.heading(col, text=txt)
@@ -2836,6 +2864,17 @@ class QuickDashCamApp(ctk.CTk):
         self.shorts_tree.configure(yscrollcommand=sb.set)
         self.shorts_tree.bind("<<TreeviewSelect>>", self._on_shorts_tree_select)
         self.shorts_tree.bind("<Double-1>", lambda _e: self._shorts_toggle_selected())
+
+    def _shorts_toggle_options(self, show: Optional[bool] = None) -> None:
+        """작은 창에서도 장면 목록이 보이도록 쇼츠 옵션 영역을 접거나 펼칩니다."""
+        visible = bool(self.shorts_opts_frame.winfo_ismapped())
+        want = (not visible) if show is None else show
+        if want:
+            self.shorts_opts_frame.grid()
+            self.btn_shorts_opts.configure(text="⚙ 옵션 접기")
+        else:
+            self.shorts_opts_frame.grid_remove()
+            self.btn_shorts_opts.configure(text="⚙ 옵션 펼치기")
 
     # 설정 읽기
 
@@ -2880,6 +2919,7 @@ class QuickDashCamApp(ctk.CTk):
             bgm_path=self.shorts_bgm_path,
             title_text=self.shorts_title_entry.get().strip(),
             show_timestamp=bool(self.shorts_ts_var.get()),
+            show_captions=bool(self.shorts_caption_var.get()),
             quality_preset=base.quality_preset,
             use_hw_accel=base.use_hw_accel,
         )
@@ -2900,6 +2940,11 @@ class QuickDashCamApp(ctk.CTk):
     def _shorts_settings_changed(self) -> None:
         """길이·장면 길이 등을 바꾸면, 분석 캐시가 준비된 경우 즉시 하이라이트를 다시 고릅니다."""
         if self.is_busy or not self.highlight_clips or not self.videos:
+            return
+        if self._get_ai_mode() != AiDirectorMode.OFF:
+            self.shorts_info_label.configure(
+                text="⚙ 설정이 바뀌었습니다 — [✨ 하이라이트 찾기]를 다시 누르면 Claude가 새 설정으로 장면을 고릅니다."
+            )
             return
         hcfg = self._get_highlight_config()
         ready = all(v.feature_cache is not None for v in self.videos)
@@ -2942,14 +2987,19 @@ class QuickDashCamApp(ctk.CTk):
                 continue
             if c.included:
                 marks.append(g)
-            rel = (c.score / max_score) if max_score > 0 else 0.0
-            bar = "█" * max(1, int(round(rel * 8)))
+            if c.ai_score is not None:
+                bar = "█" * max(1, int(round(c.ai_score / 10.0 * 8)))
+                score_txt = f"{bar} AI {c.ai_score:.0f}/10"
+            else:
+                rel = (c.score / max_score) if max_score > 0 else 0.0
+                bar = "█" * max(1, int(round(rel * 8)))
+                score_txt = f"{bar} {rel * 100:.0f}"
             tree.insert(
                 "", "end", iid=str(i),
                 values=(
                     i + 1, "✔ 사용" if c.included else "✕ 제외", format_duration(g[0], True),
                     f"{c.duration:.1f}초", f"#{clip_no.get(id(c.video), '?')}", c.reason or "-",
-                    f"{bar} {rel * 100:.0f}",
+                    c.caption or "-", score_txt,
                 ),
                 tags=("on" if c.included else "off",),
             )
@@ -3043,12 +3093,64 @@ class QuickDashCamApp(ctk.CTk):
 
     # 하이라이트 찾기 / 쇼츠 만들기
 
+    def _get_ai_mode(self) -> AiDirectorMode:
+        val = self.shorts_ai_var.get()
+        if val.startswith("Claude Code"):
+            return AiDirectorMode.CLAUDE_CODE
+        if val.startswith("Claude API"):
+            return AiDirectorMode.CLAUDE_API
+        return AiDirectorMode.OFF
+
+    def _prepare_ai_mode(self) -> Optional[Tuple[AiDirectorMode, Optional[str]]]:
+        """(메인 스레드) AI 사용 동의·설치·API 키를 확인합니다. None이면 사용자가 작업을 취소한 것."""
+        mode = self._get_ai_mode()
+        if mode == AiDirectorMode.OFF:
+            return mode, None
+        if not self._ai_consent_given:
+            ok = messagebox.askyesno(
+                "AI 장면 선정 안내",
+                "Claude가 장면을 고르도록 후보 장면의 사진(장면당 3장, 저해상도)을 Anthropic 서버로 보냅니다.\n"
+                "사진에 번호판·사람·장소가 보일 수 있습니다.\n\n"
+                "계속할까요? ('아니요'를 누르면 이번에는 알고리즘으로만 고릅니다)",
+            )
+            if not ok:
+                return AiDirectorMode.OFF, None
+            self._ai_consent_given = True
+        if mode == AiDirectorMode.CLAUDE_CODE:
+            if find_claude_cli() is None:
+                use_algo = messagebox.askyesno(
+                    "Claude Code를 찾지 못함",
+                    "이 PC에서 Claude Code(claude 명령)를 찾지 못했습니다.\n"
+                    "설치 후 터미널에서 `claude`를 한 번 실행해 로그인해 주세요.\n\n"
+                    "이번에는 알고리즘으로만 고를까요?",
+                )
+                return (AiDirectorMode.OFF, None) if use_algo else None
+            return mode, None
+        key = os.environ.get("ANTHROPIC_API_KEY") or self._anthropic_api_key
+        if not key:
+            key = simpledialog.askstring(
+                "Claude API 키",
+                "Claude API 키를 입력해 주세요 (sk-ant-...).\n이번 실행 동안만 기억하고 파일로 저장하지 않습니다.",
+                show="*", parent=self,
+            )
+            if not key:
+                return None
+            self._anthropic_api_key = key.strip()
+            key = self._anthropic_api_key
+        return mode, key
+
     def _compute_highlights_in_worker(
         self, acfg: AnalysisConfig, hcfg: HighlightConfig, prog_scale: float,
-    ) -> List[HighlightClip]:
-        """(작업 스레드) 미분석 영상 분석 → 오디오 음량 추출 → 하이라이트 선정. 진행률 0~prog_scale."""
+        ai_mode: AiDirectorMode = AiDirectorMode.OFF, api_key: Optional[str] = None,
+    ) -> Tuple[List[HighlightClip], str, Optional[str]]:
+        """
+        (작업 스레드) 미분석 영상 분석 → 오디오 음량 추출 → 하이라이트 선정(알고리즘 또는 Claude).
+        반환: (하이라이트 목록, AI 제안 제목, AI 실패 메시지). AI가 실패하면 알고리즘 결과로 대신합니다.
+        """
         videos = list(self.videos)
         total_v = max(1, len(videos))
+        use_ai = ai_mode != AiDirectorMode.OFF
+        prep_share = 0.5 if use_ai else 1.0
 
         def report(frac: float, msg: str) -> None:
             self.after(0, lambda f=frac, m=msg: (
@@ -3060,7 +3162,8 @@ class QuickDashCamApp(ctk.CTk):
                 raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
             if v.feature_cache is None:
                 def on_prog(frac: float, i=idx, name=v.filename):
-                    report((i + frac * 0.85) / total_v, f"[하이라이트] 주행 장면 분석 {i + 1}/{total_v}: {name} ({frac * 100:.0f}%)")
+                    report((i + frac * 0.85) / total_v * prep_share,
+                           f"[하이라이트] 주행 장면 분석 {i + 1}/{total_v}: {name} ({frac * 100:.0f}%)")
 
                 old_segs = list(v.segments)
                 segs = analyze_video(v, acfg, progress_callback=on_prog, cancel_check=lambda: self.cancel_requested)
@@ -3071,12 +3174,59 @@ class QuickDashCamApp(ctk.CTk):
                     v.analyzed = True
                 self.after(0, lambda: (self._refresh_video_list_ui(), self._update_timeline_and_preview()))
             if hcfg.use_audio_peaks and v.has_audio:
-                report((idx + 0.9) / total_v, f"[하이라이트] 소리 이벤트(경적 등) 분석 {idx + 1}/{total_v}: {v.filename}")
+                report((idx + 0.9) / total_v * prep_share,
+                       f"[하이라이트] 소리 이벤트(경적 등) 분석 {idx + 1}/{total_v}: {v.filename}")
                 ensure_audio_levels(v, cancel_check=lambda: self.cancel_requested)
         if self.cancel_requested:
             raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
+
+        if use_ai:
+            try:
+                clips, title = ai_select_highlights(
+                    videos, hcfg, ai_mode, api_key=api_key,
+                    progress=lambda f, m: report(prep_share + (1.0 - prep_share) * f, m),
+                    cancel_check=lambda: self.cancel_requested,
+                )
+                return clips, title, None
+            except AiDirectorError as exc:
+                if self.cancel_requested:
+                    raise RuntimeError("사용자에 의해 작업이 취소되었습니다.") from exc
+                ai_error = str(exc)
+            except Exception as exc:  # 예상치 못한 오류도 알고리즘 결과로 대신
+                if self.cancel_requested:
+                    raise RuntimeError("사용자에 의해 작업이 취소되었습니다.") from exc
+                ai_error = f"{type(exc).__name__}: {exc}"
+            report(1.0, "[하이라이트] AI 선정 실패 — 알고리즘으로 장면을 고르는 중...")
+            return select_highlights(videos, hcfg), "", ai_error
+
         report(1.0, "[하이라이트] 볼 만한 장면을 고르는 중...")
-        return select_highlights(videos, hcfg)
+        return select_highlights(videos, hcfg), "", None
+
+    def _apply_highlight_result(self, clips: List[HighlightClip], title: str, ai_error: Optional[str]) -> str:
+        """(메인 스레드) 선정 결과를 화면에 반영하고 상태 메시지를 돌려줍니다."""
+        self.highlight_clips = clips
+        self.highlight_index = None
+        if clips:
+            self._shorts_toggle_options(show=False)  # 결과 목록이 잘 보이도록 옵션 영역 자동 접기
+        if title and not self.shorts_title_entry.get().strip():
+            self.shorts_title_entry.insert(0, title)
+        self._refresh_shorts_ui()
+        used = [c for c in clips if c.included]
+        total = sum(c.duration for c in used)
+        if ai_error:
+            messagebox.showwarning(
+                "AI 장면 선정 실패",
+                f"{ai_error}\n\n대신 알고리즘이 고른 장면으로 표시합니다.",
+            )
+        if not clips:
+            return "하이라이트로 쓸 만한 주행 장면을 찾지 못했습니다 (정차·잘라내기 구간은 제외됩니다)."
+        if any(c.ai_score is not None for c in clips):
+            return (
+                f"🤖 Claude가 후보 {len(clips)}개 중 {len(used)}개 선정 (약 {total:.0f}초)"
+                + (f" · 제목 제안: {title}" if title else "")
+                + " — 제외된 후보도 더블클릭으로 바꿔 넣을 수 있습니다."
+            )
+        return f"✨ 하이라이트 {len(used)}개 선정 (약 {total:.0f}초) — 목록에서 장면을 확인하고 [🎬 쇼츠 만들기]를 누르세요."
 
     def _on_find_highlights(self) -> None:
         if self.is_busy:
@@ -3086,6 +3236,10 @@ class QuickDashCamApp(ctk.CTk):
             return
         self._stop_preview_play()
         self.left_tabs.set(TAB_SHORTS)
+        prepared = self._prepare_ai_mode()
+        if prepared is None:
+            return
+        ai_mode, api_key = prepared
         acfg = self._get_current_analysis_config()
         hcfg = self._get_highlight_config()
         self._set_busy_state(True, "하이라이트 장면을 찾는 중...")
@@ -3093,19 +3247,12 @@ class QuickDashCamApp(ctk.CTk):
 
         def worker():
             try:
-                clips = self._compute_highlights_in_worker(acfg, hcfg, 1.0)
+                clips, title, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 1.0, ai_mode, api_key)
 
                 def done():
-                    self.highlight_clips = clips
-                    self.highlight_index = None
                     self.progress_bar.set(1.0)
-                    self._refresh_shorts_ui()
-                    total = sum(c.duration for c in clips)
-                    self._set_busy_state(
-                        False,
-                        f"✨ 하이라이트 {len(clips)}개 선정 (약 {total:.0f}초) — 목록에서 장면을 확인하고 [🎬 쇼츠 만들기]를 누르세요."
-                        if clips else "하이라이트로 쓸 만한 주행 장면을 찾지 못했습니다 (정차·잘라내기 구간은 제외됩니다).",
-                    )
+                    msg = self._apply_highlight_result(clips, title, ai_error)
+                    self._set_busy_state(False, msg)
 
                 self.after(0, done)
             except Exception as exc:
@@ -3151,6 +3298,12 @@ class QuickDashCamApp(ctk.CTk):
 
         shorts_cfg = self._get_shorts_export_config(output_path)
         need_search = not any(c.included for c in self.highlight_clips)
+        ai_mode, api_key = AiDirectorMode.OFF, None
+        if need_search:
+            prepared = self._prepare_ai_mode()
+            if prepared is None:
+                return
+            ai_mode, api_key = prepared
         acfg = self._get_current_analysis_config()
         hcfg = self._get_highlight_config()
         self.left_tabs.set(TAB_SHORTS)
@@ -3160,9 +3313,11 @@ class QuickDashCamApp(ctk.CTk):
         def worker():
             try:
                 if need_search:
-                    clips = self._compute_highlights_in_worker(acfg, hcfg, 0.3)
+                    clips, title, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 0.3, ai_mode, api_key)
+                    if title and not shorts_cfg.title_text:
+                        shorts_cfg.title_text = title
                     self.highlight_clips = clips
-                    self.after(0, self._refresh_shorts_ui)
+                    self.after(0, lambda: self._apply_highlight_result(clips, title, ai_error))
                 base = 0.3 if need_search else 0.0
                 # 하이라이트를 고른 뒤 사용자가 잘라낸(삭제한) 영상 부분은 쇼츠에도 넣지 않음
                 use = [
