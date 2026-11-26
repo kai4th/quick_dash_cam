@@ -311,6 +311,7 @@ STEER_REJECT = 0.7       # 조향(회전) 정규값이 이 이상이면 해당 �
 SURPRISE_PENALTY = 0.6   # 주변 흐름 대비 급격한 화면 변화 감점 정도
 SCENE_EXCESS_START = 0.7  # 화면 변화량이 상위 수준을 넘는 만큼 감점 시작
 SLOW_SPEED_MIN = 0.35    # 아주 느린 주행(주차장·골목)의 최소 배율
+STEER_SCALE_FLOOR = 1.5   # 회전이 거의 없는 주행에서 차선 안 미세한 흔들림을 '회전'으로 오인하지 않도록 정규화 하한
 MIN_WINDOW_QUALITY = 0.15  # 이보다 불안정한 컷은 '다르게 보여도' 쓰지 않음 (어지러운 컷보다 컷 수가 모자란 게 나음)
 
 
@@ -353,6 +354,8 @@ def compute_highlight_scores(
         sc = float(np.percentile(allv, 95))
         if sc <= 1e-6:
             sc = float(np.max(allv))
+        if key == "steer":
+            sc = max(sc, STEER_SCALE_FLOOR)
         if sc > 1e-6:
             scales[key] = sc
 
