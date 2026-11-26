@@ -3355,8 +3355,10 @@ class QuickDashCamApp(ctk.CTk):
                         self.progress_bar.set(f), self.status_label.configure(text=f"[쇼츠 만들기] {m}")
                     ))
 
+                render_warnings: List[str] = []
                 final_path = render_highlight_shorts(
                     use, shorts_cfg, progress_callback=on_prog, cancel_check=lambda: self.cancel_requested,
+                    warnings=render_warnings,
                 )
 
                 def on_success():
@@ -3364,10 +3366,11 @@ class QuickDashCamApp(ctk.CTk):
                     self.progress_bar.set(1.0)
                     self.btn_open_folder.configure(state="normal")
                     self._set_busy_state(False, f"✅ 쇼츠 완성! 저장된 파일: {final_path}")
-                    messagebox.showinfo(
+                    note = ("\n\n⚠ " + "\n⚠ ".join(render_warnings)) if render_warnings else ""
+                    (messagebox.showwarning if render_warnings else messagebox.showinfo)(
                         "쇼츠 완성",
                         f"하이라이트 쇼츠 영상이 완성되었습니다!\n\n장면 {len(use)}개 · 약 "
-                        f"{sum(c.duration for c in use):.0f}초\n\n저장 경로:\n{final_path}",
+                        f"{sum(c.duration for c in use):.0f}초\n\n저장 경로:\n{final_path}{note}",
                     )
 
                 self.after(0, on_success)

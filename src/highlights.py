@@ -972,7 +972,7 @@ def _encode_highlight_clip(
     cmd += ["-filter_complex", graph, "-map", "[v]"]
     if with_audio:
         cmd += ["-map", "[a]"]
-    cmd += ["-c:v", encoder_name, *encoder_args]
+    cmd += ["-c:v", encoder_name, *encoder_args, "-r", f"{cfg.fps:.3f}"]  # 중간 파일에도 프레임레이트 명시
     if with_audio:
         cmd += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"]
     else:
@@ -1040,6 +1040,7 @@ def _join_with_transitions(
     trans_sec: float,
     transition: ShortsTransition,
     with_audio: bool,
+    fps: float,
     encoder_name: str,
     encoder_args: List[str],
     out_path: Path,
@@ -1055,7 +1056,9 @@ def _join_with_transitions(
         cmd += ["-i", str(sf)]
     parts: List[str] = []
     for i in range(len(seg_files)):
-        parts.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[v{i}]")
+        # xfade는 입력의 프레임레이트가 확정돼 있어야 함. GPU 인코더 출력이나 일부 FFmpeg 버전(settb 사용 시)에서
+        # 프레임레이트가 '알 수 없음(1/0)'이 되는 경우가 있어 fps 필터로 명시적으로 고정
+        parts.append(f"[{i}:v]setpts=PTS-STARTPTS,fps={fps:.3f}[v{i}]")
         if with_audio:
             parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
     prev_v, prev_a = "v0", "a0"
@@ -1086,8 +1089,12 @@ def render_highlight_shorts(
     cfg: ShortsExportConfig,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    warnings: Optional[List[str]] = None,
 ) -> Path:
-    """선정된 하이라이트 장면들을 쇼츠 영상(MP4) 하나로 만듭니다."""
+    """
+    선정된 하이라이트 장면들을 쇼츠 영상(MP4) 하나로 만듭니다.
+    warnings 리스트를 넘기면, 완성은 됐지만 사용자에게 알릴 내용(예: 전환 효과 실패로 바로 컷 적용)을 담아 줍니다.
+    """
     use_clips = [c for c in clips if c.included and c.duration >= 0.5]
     if not use_clips:
         raise ValueError("쇼츠에 넣을 하이라이트 장면이 없습니다. 하이라이트를 먼저 찾아 주세요.")
@@ -1185,11 +1192,18 @@ def render_highlight_shorts(
             if progress_callback:
                 name = "크로스 디졸브" if cfg.transition == ShortsTransition.DISSOLVE else "페이드"
                 progress_callback(encode_share, f"장면 사이를 {name}로 자연스럽게 잇는 중...")
-            jargs = (ffmpeg, seg_files, seg_durs, trans, cfg.transition, clip_audio)
+            jargs = (ffmpeg, seg_files, seg_durs, trans, cfg.transition, clip_audio, cfg.fps)
             ok, err = _join_with_transitions(*jargs, enc_name, enc_args, joined, cancel_check)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):
                 ok, err = _join_with_transitions(*jargs, sw_name, sw_args, joined, cancel_check)
-        else:
+            if not ok and not (cancel_check and cancel_check()):
+                # 전환 효과 단계가 실패해도 쇼츠는 완성되도록 바로 컷으로 이어 붙임
+                first_line = next((ln for ln in err.splitlines() if ln.strip()), "알 수 없는 오류")
+                if warnings is not None:
+                    warnings.append(f"장면 전환 효과를 적용하지 못해 '바로 컷'으로 이었습니다.\n(원인: {first_line[:200]})")
+                use_xfade = False
+                total_dur = sum(seg_durs)
+        if not use_xfade:
             if progress_callback:
                 progress_callback(0.92, "하이라이트 장면들을 하나의 쇼츠 영상으로 잇는 중...")
             concat_list = tmp / "concat_list.txt"

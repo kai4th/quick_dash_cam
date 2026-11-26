@@ -417,6 +417,22 @@ def test_shorts_transitions() -> None:
         assert all(x > 3 for x in diffs), "dissolve midpoint should be a blend, not either cut"
         print("[PASS] Cross-dissolve / fade-through-black / cut transitions verified!")
 
+        # 전환 효과 단계가 실패하면(예: FFmpeg 버전·GPU 인코더 차이) 바로 컷으로 완성하고 경고를 남겨야 함
+        import src.highlights as hl
+        real_join = hl._join_with_transitions
+        hl._join_with_transitions = lambda *a, **k: (
+            False, "[Parsed_xfade_30 @ 0x0] The inputs needs to be a constant frame rate; current rate of 1/0 is invalid")
+        try:
+            warns: list = []
+            out = tmp_dir / "tr_fallback.mp4"
+            render_highlight_shorts(clips, ShortsExportConfig(output_path=out, resolution="720p"), warnings=warns)
+            p = probe_video_file(out)
+            assert out.exists() and p.duration_sec > 8.0, p.duration_sec
+            assert warns and "바로 컷" in warns[0] and "constant frame rate" in warns[0], warns
+        finally:
+            hl._join_with_transitions = real_join
+        print("[PASS] Transition failure falls back to hard cuts with a warning")
+
 
 if __name__ == "__main__":
     test_sorter()
