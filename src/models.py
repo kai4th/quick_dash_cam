@@ -355,6 +355,6 @@ class ShortsExportConfig:
     title_text: str = ""                  # 화면 상단 제목 (빈 문자열이면 표시 안 함)
     show_timestamp: bool = True           # 장면별 촬영 시각 표시
     show_captions: bool = False           # AI가 제안한 장면 자막 표시
-    auto_level: bool = True               # 카메라 기울기를 감지해 수평(지평선)을 자동으로 맞춤
+    auto_level: bool = False              # (실험적) 카메라 기울기를 직선으로 추정해 수평을 맞춤 — 짐벌 영상은 이미 수평이라 기본 꺼짐
     quality_preset: VideoQualityPreset = VideoQualityPreset.HIGH
     use_hw_accel: bool = True

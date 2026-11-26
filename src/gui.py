@@ -2774,9 +2774,10 @@ class QuickDashCamApp(ctk.CTk):
         row3 = ctk.CTkFrame(opts, fg_color="transparent")
         row3.pack(fill="x", padx=6, pady=(1, 4))
         ctk.CTkLabel(row3, text="제목", font=small).pack(side="left", padx=(0, 3))
-        self.shorts_level_var = ctk.BooleanVar(value=True)
+        # 시골길·전선이 많은 장면에서는 직선 기반 추정이 틀릴 수 있고, 짐벌 영상은 원래 수평이라 기본 꺼짐
+        self.shorts_level_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
-            row3, text="수평 자동 보정", variable=self.shorts_level_var, font=ctk.CTkFont(size=10),
+            row3, text="수평 자동 보정 (실험적)", variable=self.shorts_level_var, font=ctk.CTkFont(size=10),
             checkbox_width=16, checkbox_height=16,
         ).pack(side="right", padx=(6, 0))
         self.shorts_title_entry = ctk.CTkEntry(

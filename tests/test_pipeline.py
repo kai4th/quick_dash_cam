@@ -477,7 +477,7 @@ def test_horizon_leveling_and_quality() -> None:
             out = tmp_dir / f"leveled_{deg}.mp4"
             notes: list = []
             render_highlight_shorts([HighlightClip(v, 16.0, 19.0)], ShortsExportConfig(
-                output_path=out, layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False,
+                output_path=out, layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False, auto_level=True,
             ), notes=notes)
             raw = subprocess.run(
                 [get_ffmpeg_exe(), "-loglevel", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1",
@@ -503,7 +503,7 @@ def test_horizon_leveling_and_quality() -> None:
         nv = probe_video_file(nudge)
         notes = []
         render_highlight_shorts([HighlightClip(nv, 2.0, 5.0), HighlightClip(nv, 24.0, 27.0)], ShortsExportConfig(
-            output_path=tmp_dir / "nudge_out.mp4", layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False,
+            output_path=tmp_dir / "nudge_out.mp4", layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False, auto_level=True,
         ), notes=notes)
         print("Per-cut leveling notes:", notes)
         assert any("컷 1" in n_ and "+3.0°" in n_ for n_ in notes), notes
