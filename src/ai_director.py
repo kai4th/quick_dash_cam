@@ -392,13 +392,18 @@ def _explain_cli_failure(exe: str, err: str) -> str:
     low = err.lower()
     msg = f"Claude Code 실행에 실패했습니다.\n\n[사용한 claude 경로]\n{exe}\n\n[Claude Code가 보낸 메시지]\n{err[:1200]}"
     if _looks_like_auth_error(low):
+        # PATH에 등록되지 않은 경우가 있어(예: ~/.local/bin) 실제로 찾은 전체 경로로 안내
+        on_path = shutil.which("claude") is not None
+        run = "claude" if on_path else (f'& "{exe}"' if os.name == "nt" else f'"{exe}"')
         msg += (
             "\n\n[해결 방법]\n"
-            "1) PowerShell(또는 터미널)을 열고 `claude`를 실행합니다.\n"
-            "2) 로그인 화면이 나오면 Claude 구독 계정으로 로그인합니다 (이미 실행 중이면 `/login` 입력).\n"
-            "3) `claude -p \"안녕\"`을 실행해 답이 나오면 앱에서 다시 시도하세요.\n"
+            f"1) PowerShell(또는 터미널)을 열고 다음을 실행합니다:\n   {run}\n"
+            "2) Claude 구독 계정으로 로그인한 뒤 `/exit`로 종료합니다 (이미 입력창이 뜨면 `/login` 입력).\n"
+            f"3) {run} -p \"안녕\" 을 실행해 답이 나오면 앱에서 다시 시도하세요.\n"
             "※ Claude 데스크톱 앱·웹 로그인과 터미널용 claude 로그인은 별개입니다."
         )
+        if not on_path:
+            msg += "\n※ claude가 PATH에 등록되어 있지 않아 터미널에서 `claude`만 입력하면 실행되지 않습니다."
     elif "credit" in low or "usage limit" in low or "rate limit" in low:
         msg += "\n\n구독 사용량 한도에 걸렸을 수 있습니다. 잠시 후 다시 시도하거나 [Claude API] 방식을 사용해 주세요."
     return msg
