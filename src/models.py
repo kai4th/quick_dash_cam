@@ -336,8 +336,8 @@ class HighlightClip:
 class HighlightConfig:
     target_duration_sec: float = 30.0     # 완성 쇼츠 목표 길이
     clip_duration_sec: float = 3.0        # 장면 하나당 길이
-    use_audio_peaks: bool = True          # 경적·큰 소리 등 오디오 이벤트도 하이라이트 점수에 반영
-    straight_weight: float = 0.35         # 고속도로 직진 구간의 점수 가중치 (0 = 제외)
+    use_audio_peaks: bool = False         # (사용 안 함) 오디오 급변은 컷 안의 변화라 안정적인 컷 기준에서 제외
+    straight_weight: float = 1.0          # 고속도로 직진(순항) 구간 가중치 — 차분한 순항은 좋은 컷이므로 감점 없음
 
 
 @dataclass

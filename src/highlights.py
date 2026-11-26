@@ -1,13 +1,13 @@
 """
 주행 영상 하이라이트 쇼츠 생성기.
 
-1) 점수 계산: 구간 분석(analyzer) 단계에서 이미 추출·캐싱된 프레임별 특징값(조향, 풍경 변화, 움직임)과
-   오디오 음량 급변(경적·큰 소리)을 결합해 "볼 만한 순간" 점수 곡선을 만듭니다.
-   신호대기/정차·수동 잘라내기 구간은 제외하고, 고속도로 직진 구간은 가중치를 낮춥니다.
-2) 장면 선정: 점수가 가장 높은 N초 창(window)부터 차례로 고르되, 전체 주행이 고루 담기도록
-   이미 고른 장면 주변은 일정 간격만큼 건너뜁니다. 고른 장면은 시간순으로 정렬됩니다.
-3) 렌더링: 장면별로 세로 9:16(흐림 배경 / 꽉 채우기) 또는 가로 16:9 레이아웃, 페이드 전환,
-   제목·촬영 시각 오버레이를 입혀 인코딩한 뒤 하나로 이어 붙이고, 필요 시 배경음악을 입힙니다.
+1) 컷 품질 점수: 구간 분석(analyzer)에서 캐싱된 프레임별 특징값(조향, 화면 변화, 노면 움직임)으로
+   "차가 안정적으로 앞으로 달리고 컷 안의 화면이 차분한 정도"를 계산합니다.
+   좌·우회전, 주차장 출입(출발·도착 부근·저속), 급격한 화면 변화는 감점/제외하고, 정차·잘라내기 구간은 쓰지 않습니다.
+2) 장면 선정: 컷 안에서는 차분하되 컷끼리는 서로 달라 보이도록, 구간 분석 때 저장한 썸네일(색 분포·구도)로
+   이미 고른 컷들과 가장 다른 장면을 차례로 고릅니다. 고른 장면은 시간순으로 정렬됩니다.
+3) 렌더링: 수평 보정 → 세로 9:16(흐림 배경 / 꽉 채우기) 또는 가로 16:9 레이아웃 → 제목·자막·촬영 시각 오버레이 →
+   컷 사이 크로스 디졸브로 이어 붙이고, 필요 시 배경음악을 입힙니다.
 """
 from __future__ import annotations
 
@@ -45,24 +45,6 @@ from .models import (
 
 AUDIO_SAMPLE_RATE = 8000
 AUDIO_CACHE_VERSION = "audio_rms_v1"
-
-# 하이라이트 점수 구성 요소별 가중치
-COMPONENT_WEIGHTS: Dict[str, float] = {
-    "steer": 0.30,     # 회전·커브·차선 변경 (수평 조향 이동량)
-    "scene": 0.25,     # 도로변 풍경·구도 변화 (시내, 산길, 해안도로 등)
-    "surprise": 0.20,  # 주변 흐름 대비 갑작스러운 화면 변화 (끼어들기, 돌발 상황)
-    "audio": 0.15,     # 경적·큰 소리 등 주변 대비 음량 급증
-    "motion": 0.10,    # 노면 움직임 (역동적인 주행)
-}
-
-REASON_LABELS: Dict[str, str] = {
-    "steer": "회전·커브",
-    "scene": "풍경 변화",
-    "surprise": "돌발 장면",
-    "audio": "소리 이벤트",
-    "motion": "역동적 주행",
-}
-
 
 # ── 공용 신호 처리 ──
 
@@ -279,8 +261,8 @@ def _type_weights(video: VideoFileInfo, ts: np.ndarray, straight_weight: float) 
 
 
 TRIP_GAP_SEC = 300.0      # 녹화 시각 사이가 5분 넘게 비면 다른 주행(출발·도착이 따로 있음)으로 봄
-TRIP_EDGE_MAX_SEC = 90.0  # 주행 시작·끝 이 시간만큼은 주차장·골목일 가능성이 높아 점수를 낮춤
-TRIP_EDGE_MIN_FACTOR = 0.3
+TRIP_EDGE_MAX_SEC = 180.0  # 주행 시작·끝 이 시간만큼은 주차장·골목일 가능성이 높아 점수를 낮춤
+TRIP_EDGE_MIN_FACTOR = 0.1
 
 
 def _trip_edge_factors(
@@ -309,7 +291,7 @@ def _trip_edge_factors(
     factors: List[Optional[np.ndarray]] = [None] * len(videos)
     for trip in trips:
         trip_len = sum(videos[i].duration_sec for i in trip)
-        edge = min(TRIP_EDGE_MAX_SEC, trip_len * 0.15)
+        edge = min(TRIP_EDGE_MAX_SEC, trip_len * 0.2)
         if edge <= 0:
             continue
         offset = 0.0
@@ -323,13 +305,24 @@ def _trip_edge_factors(
     return factors
 
 
+# 좋은 컷 = 차가 안정적으로 앞으로 달리고 컷 안에서 화면이 차분한 장면.
+# (컷 안의 큰 변화 — 좌·우회전, 주차장 출입, 터널 진출입, 급변 — 는 쇼츠에서 어지러움만 줌)
+STEER_REJECT = 0.7       # 조향(회전) 정규값이 이 이상이면 해당 순간은 사용 불가
+SURPRISE_PENALTY = 0.6   # 주변 흐름 대비 급격한 화면 변화 감점 정도
+SCENE_EXCESS_START = 0.7  # 화면 변화량이 상위 수준을 넘는 만큼 감점 시작
+SLOW_SPEED_MIN = 0.35    # 아주 느린 주행(주차장·골목)의 최소 배율
+MIN_WINDOW_QUALITY = 0.15  # 이보다 불안정한 컷은 '다르게 보여도' 쓰지 않음 (어지러운 컷보다 컷 수가 모자란 게 나음)
+
+
 def compute_highlight_scores(
     videos: List[VideoFileInfo],
     config: HighlightConfig,
 ) -> List[Optional[Dict[str, np.ndarray]]]:
     """
-    전체 영상에 공통 기준(백분위 정규화)을 적용해 영상별 하이라이트 점수 곡선을 계산합니다.
-    반환 리스트의 각 원소: {"ts", "score", "cut", "fps", "<component>_n"...} 또는 분석 전이면 None.
+    영상별 '안정적인 컷' 점수 곡선(0~1)을 계산합니다. 전체 영상 공통 기준(백분위)으로 정규화.
+    - 회전 중(조향 큼)이면 0에 가깝게, 급격한 화면 변화·과도한 변화량은 감점
+    - 정차·잘라내기 구간은 0, 출발·도착 부근(주차장 가능성)과 아주 느린 주행은 감점
+    반환 원소: {"ts", "score", "cut", "blocked", "straight", "fps"} 또는 분석 전이면 None.
     """
     raw: List[Optional[Dict[str, np.ndarray]]] = []
     for v in videos:
@@ -338,20 +331,24 @@ def compute_highlight_scores(
             comps.pop("audio", None)
         raw.append(comps)
 
-    # 영상 전체에서 공통 정규화 기준(95백분위)을 구해 영상 간 점수를 비교 가능하게 맞춤
+    # 움직이는 구간 기준 공통 정규화 값 (조향·변화량은 95백분위, 속도 기준은 중앙값)
     scales: Dict[str, float] = {}
-    for key in COMPONENT_WEIGHTS:
+    motion_ref = 0.0
+    for key in ("steer", "scene", "surprise", "motion"):
         pool: List[np.ndarray] = []
         for v, comps in zip(videos, raw):
-            if comps is None or key not in comps:
+            if comps is None:
                 continue
-            w, _cut = _type_weights(v, comps["ts"], config.straight_weight)
+            w, _cut = _type_weights(v, comps["ts"], 1.0)
             vals = comps[key][w > 0]
             pool.append(vals if len(vals) else comps[key])
         if not pool:
             continue
         allv = np.concatenate(pool)
         if len(allv) == 0:
+            continue
+        if key == "motion":
+            motion_ref = float(np.median(allv))
             continue
         sc = float(np.percentile(allv, 95))
         if sc <= 1e-6:
@@ -361,6 +358,11 @@ def compute_highlight_scores(
 
     edge_factors = _trip_edge_factors(videos, [c["ts"] if c is not None else None for c in raw])
 
+    def norm(comps: Dict[str, np.ndarray], key: str) -> np.ndarray:
+        if key not in scales:
+            return np.zeros(len(comps["ts"]), dtype=np.float32)
+        return np.clip(comps[key] / scales[key], 0.0, 1.5).astype(np.float32)
+
     results: List[Optional[Dict[str, np.ndarray]]] = []
     for v, comps, edge in zip(videos, raw, edge_factors):
         if comps is None:
@@ -369,37 +371,40 @@ def compute_highlight_scores(
         ts = comps["ts"]
         type_w, cut = _type_weights(v, ts, config.straight_weight)
         blocked = type_w <= 0.0
+        straight = np.zeros(len(ts), dtype=bool)
+        for seg in v.segments:
+            if seg.segment_type == SegmentType.STRAIGHT:
+                straight |= (ts >= seg.start_sec) & (ts < seg.end_sec)
+
+        steer_n = norm(comps, "steer")
+        surprise_n = norm(comps, "surprise")
+        scene_n = norm(comps, "scene")
+        stable = np.clip(1.0 - steer_n / STEER_REJECT, 0.0, 1.0) ** 2           # 회전 중이면 0
+        stable *= 1.0 - SURPRISE_PENALTY * np.clip(surprise_n, 0.0, 1.0)        # 급변 감점
+        stable *= 1.0 - 0.5 * np.clip(scene_n - SCENE_EXCESS_START, 0.0, 1.0)  # 과도한 변화 감점
+        if motion_ref > 1e-6:
+            # 아주 느린 주행(주차장·골목) 감점. 노면 질감이 적은 고속도로는 속도 판단이 부정확해 직진 구간엔 적용 안 함
+            speed = np.clip((comps["motion"] / motion_ref - 0.25) / 0.5, SLOW_SPEED_MIN, 1.0)
+            stable *= np.where(straight, 1.0, speed)
         if edge is not None:
-            type_w = type_w * edge  # 출발·도착 부근(주차장일 가능성 높음) 감점
-        total_w = 0.0
-        score = np.zeros(len(ts), dtype=np.float32)
-        out: Dict[str, np.ndarray] = {"ts": ts, "cut": cut}
-        for key, wt in COMPONENT_WEIGHTS.items():
-            if key not in comps:
-                continue
-            total_w += wt
-            if key in scales:
-                norm = np.clip(comps[key] / scales[key], 0.0, 1.5).astype(np.float32)
-            else:
-                norm = np.zeros(len(ts), dtype=np.float32)
-            out[f"{key}_n"] = norm * wt * type_w
-            score += norm * wt
-        if total_w > 0:
-            score /= total_w
-            for key in COMPONENT_WEIGHTS:
-                if f"{key}_n" in out:
-                    out[f"{key}_n"] = out[f"{key}_n"] / total_w
-        out["score"] = score * type_w
-        out["blocked"] = blocked  # 정차·잘라내기 등 하이라이트로 쓰지 않을 샘플
-        out["fps"] = np.array([float(v.feature_cache["sample_fps"])], dtype=np.float32)  # type: ignore[index]
-        results.append(out)
+            stable *= edge  # 출발·도착 부근(주차장일 가능성 높음) 감점
+
+        results.append({
+            "ts": ts,
+            "cut": cut,
+            "score": (stable * type_w).astype(np.float32),
+            "blocked": blocked,  # 정차·잘라내기 등 하이라이트로 쓰지 않을 샘플
+            "straight": straight,
+            "fps": np.array([float(v.feature_cache["sample_fps"])], dtype=np.float32),  # type: ignore[index]
+        })
     return results
 
 
 # ── 장면 선정 ──
 
 GENERIC_REASON = "주행 장면"
-REASON_QUOTA_RATIO = 0.4  # 같은 선정 이유의 장면은 전체의 40%까지만 (커브만 잔뜩 뽑히는 것 방지)
+CRUISE_REASON = "고속도로 순항"
+REASON_QUOTA_RATIO = 0.4  # (대체 선정 방식) 같은 선정 이유의 장면은 전체의 40%까지만
 
 Window = Tuple[int, int, float]  # (video_idx, start_index, window_mean_score)
 
@@ -423,41 +428,33 @@ def _window_table(
         if n >= win:
             csum = np.concatenate([[0.0], np.cumsum(score, dtype=np.float64)])
             means = (csum[win:] - csum[:-win]) / win
+            # 컷 일부에만 회전·감속이 섞여도 어지러우므로, 평균과 함께 컷 안의 최저값도 반영
+            mins = np.lib.stride_tricks.sliding_window_view(score, win).min(axis=1).astype(np.float64)
+            means = 0.5 * means + 0.5 * mins
             ccut = np.concatenate([[0.0], np.cumsum(cut, dtype=np.float64)])
             has_cut = (ccut[win:] - ccut[:-win]) > 0
             cblk = np.concatenate([[0.0], np.cumsum(blocked, dtype=np.float64)])
-            # 장면의 25% 이상이 정차 중인 화면이면 후보에서 제외 (멈춰 있다 출발하는 지루한 장면 방지)
-            mostly_blocked = (cblk[win:] - cblk[:-win]) > 0.25 * win
+            # 정차 순간이 섞인 컷은 제외 (멈춰 있다 출발하는 것도 컷 안의 큰 변화)
+            any_blocked = (cblk[win:] - cblk[:-win]) > 0
             means = means.astype(np.float64)
-            means[has_cut | mostly_blocked] = -np.inf
+            means[has_cut | any_blocked] = -np.inf
         elif v.duration_sec >= 1.0 and not cut.any():
             means = np.array([float(np.mean(score))], dtype=np.float64)
         else:
             continue
         means[~np.isfinite(means)] = -np.inf
-        means[means <= 1e-4] = -np.inf
+        means[means < MIN_WINDOW_QUALITY] = -np.inf
         cands.append((vi, means, fps, win))
     return cands
 
 
 def _window_reason(sd: Dict[str, np.ndarray], i1: int, win: int) -> str:
-    """
-    장면 창에서 가장 두드러진 요소를 선정 이유로 붙입니다.
-    가중치가 큰 요소(조향)가 늘 이기지 않도록, 각 요소를 자기 가중치로 나눈 '상대 강도'로 비교합니다.
-    """
+    """선정 이유 표기: 대부분 직진 구간이면 '고속도로 순항', 그 외 '주행 장면'. (AI 선정 시 AI의 장면 설명으로 대체)"""
     i2 = max(i1 + 1, min(len(sd["score"]), i1 + win))
-    total, best_key, best_rel = 0.0, "", -1.0
-    for key, wt in COMPONENT_WEIGHTS.items():
-        arr = sd.get(f"{key}_n")
-        if arr is None:
-            continue
-        c = float(np.mean(arr[i1:i2]))
-        total += c
-        rel = c / wt
-        if rel > best_rel:
-            best_key, best_rel = key, rel
-    # 두드러진 요소가 없으면(모든 기여도가 미미) 일반 주행 장면으로 표기
-    return REASON_LABELS.get(best_key, GENERIC_REASON) if total >= 0.05 else GENERIC_REASON
+    straight = sd.get("straight")
+    if straight is not None and float(np.mean(straight[i1:i2])) >= 0.5:
+        return CRUISE_REASON
+    return GENERIC_REASON
 
 
 def _greedy_pick(
@@ -514,7 +511,7 @@ def _greedy_pick(
             vi, _m, fps, _w = cands[best_ci]
             s, e = bounds(vi, best_i, fps)
             r = reason_of(vi, best_i)
-            if use_quota and r != GENERIC_REASON and counts.get(r, 0) >= quota:
+            if use_quota and r not in (GENERIC_REASON, CRUISE_REASON) and counts.get(r, 0) >= quota:
                 suppress(work[best_ci], s, e, fps, 0.0)  # 이 이유는 이미 충분 → 이 장면은 건너뜀
                 continue
             picked.append((vi, best_i, best_val))

@@ -2765,11 +2765,6 @@ class QuickDashCamApp(ctk.CTk):
         ).pack(side="left", padx=(0, 4))
         self.shorts_bgm_label = ctk.CTkLabel(row2, text="(배경음악 없음)", font=small, text_color="#94a3b8")
         self.shorts_bgm_label.pack(side="left", padx=(0, 8))
-        self.shorts_audio_peak_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            row2, text="경적·큰 소리 반영", variable=self.shorts_audio_peak_var, font=ctk.CTkFont(size=10),
-            checkbox_width=16, checkbox_height=16, command=self._shorts_settings_changed,
-        ).pack(side="right", padx=(4, 0))
         self.shorts_ts_var = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(
             row2, text="촬영 시각 표시", variable=self.shorts_ts_var, font=ctk.CTkFont(size=10),
@@ -2906,7 +2901,6 @@ class QuickDashCamApp(ctk.CTk):
         return HighlightConfig(
             target_duration_sec=first_num(self.shorts_len_var.get(), 30.0),
             clip_duration_sec=first_num(self.shorts_clip_var.get(), 3.0),
-            use_audio_peaks=bool(self.shorts_audio_peak_var.get()),
         )
 
     def _get_shorts_export_config(self, output_path: Path) -> ShortsExportConfig:
@@ -3052,7 +3046,7 @@ class QuickDashCamApp(ctk.CTk):
 
         if not self.highlight_clips:
             self.shorts_info_label.configure(
-                text="💡 [✨ 하이라이트 찾기]를 누르면 회전·풍경 변화·돌발 장면·경적 소리 등 볼 만한 순간을 자동으로 골라 줍니다."
+                text="💡 [✨ 하이라이트 찾기]를 누르면 컷 안에서는 차분하고(회전·주차장·급변 제외) 컷끼리는 서로 다른 풍경을 자동으로 골라 줍니다."
             )
         else:
             used = [c for c in self.highlight_clips if c.included]

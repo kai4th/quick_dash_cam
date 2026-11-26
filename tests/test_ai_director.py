@@ -120,12 +120,15 @@ print(json.dumps(out, ensure_ascii=False))
 
 
 def _setup_videos(tmp: Path) -> list:
-    src = tmp / "VID_20261024_090000.mp4"
-    _create_synthetic_driving_video(src, duration_sec=32, fps=20)
-    v = probe_video_file(src)
-    v.segments = analyze_video(v, AnalysisConfig())
-    v.analyzed = True
-    return [v]
+    vids = []
+    for name, palette in (("VID_20261024_090000.mp4", 0), ("VID_20261024_093000.mp4", 1)):
+        src = tmp / name
+        _create_synthetic_driving_video(src, duration_sec=32, fps=20, palette=palette)
+        v = probe_video_file(src)
+        v.segments = analyze_video(v, AnalysisConfig())
+        v.analyzed = True
+        vids.append(v)
+    return vids
 
 
 def test_claude_code_backend(videos: list, tmp: Path) -> None:

@@ -40,7 +40,7 @@ from src.processor import render_merged_video
 from src.sorter import sort_video_files
 
 
-def _create_synthetic_driving_video(out_path: Path, duration_sec: int = 32, fps: int = 20) -> None:
+def _create_synthetic_driving_video(out_path: Path, duration_sec: int = 32, fps: int = 20, palette: int = 0) -> None:
     """
     테스트용 주행 영상(오디오 포함)을 생성합니다.
     - 0~15초: 영상 시작부터 신호대기 정차 중이나 전방 교차로에 다른 차량들이 계속 지나가는 상황 -> STOP
@@ -60,7 +60,7 @@ def _create_synthetic_driving_video(out_path: Path, duration_sec: int = 32, fps:
         img = np.zeros((h, w, 3), dtype=np.uint8)
 
         # 기본 배경: 상단 하늘, 하단 도로, 최하단 대시보드
-        img[: int(h * 0.42), :] = (210, 160, 110)   # 하늘
+        img[: int(h * 0.42), :] = (210, 160, 110) if palette == 0 else (90, 120, 230)   # 하늘 (palette 1: 노을)
         img[int(h * 0.42) : int(h * 0.82), :] = (70, 70, 70)  # 아스팔트 도로
         img[int(h * 0.82) :, :] = (25, 25, 25)      # 대시보드
 
@@ -110,10 +110,10 @@ def _create_synthetic_driving_video(out_path: Path, duration_sec: int = 32, fps:
 
         else:
             # 22~32초: 고속도로 직진 (지평선 원경 산봉우리/소실점은 고정, 하단 도로 차선만 일정 속도로 이동)
-            cv2.rectangle(img, (0, int(h * 0.36)), (w, int(h * 0.42)), (80, 120, 80), -1)
+            cv2.rectangle(img, (0, int(h * 0.36)), (w, int(h * 0.42)), (80, 120, 80) if palette == 0 else (60, 70, 120), -1)
             for m_x in (160, 320, 480):
                 pts = np.array([[m_x - 60, int(h * 0.38)], [m_x, int(h * 0.24)], [m_x + 60, int(h * 0.38)]], np.int32)
-                cv2.fillPoly(img, [pts], (70, 105, 75))
+                cv2.fillPoly(img, [pts], (70, 105, 75) if palette == 0 else (50, 50, 90))
             phase = int((t * 45) % 40)
             for d in range(4):
                 y_pos = int(h * 0.48) + ((d * 40 + phase) % int(h * 0.30))
@@ -295,7 +295,7 @@ def test_highlight_shorts() -> None:
         clip1 = tmp_dir / "VID_20261024_090000.mp4"
         clip2 = tmp_dir / "VID_20261024_091000.mp4"
         _create_synthetic_driving_video(clip1, duration_sec=32, fps=20)
-        clip2.write_bytes(clip1.read_bytes())
+        _create_synthetic_driving_video(clip2, duration_sec=32, fps=20, palette=1)  # 노을 색감의 다른 주행
 
         info1 = probe_video_file(clip1)
         info2 = probe_video_file(clip2)
@@ -311,6 +311,11 @@ def test_highlight_shorts() -> None:
         assert clips, "Expected at least one highlight clip"
         total = sum(c.duration for c in clips)
         assert 4.0 <= total <= 9.0, f"Unexpected highlight total duration: {total}"
+        # 좋은 컷 = 컷 안에서 차분한 장면: 회전·패닝이 계속되는 시내 구간(15~22초)은 쓰지 않고 순항 구간을 고름
+        for c in clips:
+            turning = max(0.0, min(c.end_sec, 22.0) - max(c.start_sec, 15.5))
+            assert turning <= 0.3, f"Turning/panning cut selected: {c.start_sec}-{c.end_sec}"
+        assert {id(c.video) for c in clips} == {id(info1), id(info2)}, "Distinct-looking cruise cuts from both drives"
         for c in clips:
             for seg in c.video.segments:
                 if seg.segment_type == SegmentType.STOP:
@@ -318,11 +323,12 @@ def test_highlight_shorts() -> None:
                     assert ov <= 0.3, f"Highlight overlaps traffic-light stop: {c} vs {seg}"
         ordered = [(0 if c.video is info1 else 1, c.start_sec) for c in clips]
         assert ordered == sorted(ordered), "Highlights must be in chronological order"
-        # 두 클립은 같은 영상의 복사본 → 똑같아 보이는 고속도로 장면은 한 번만 (컷끼리 배경이 겹치지 않게)
-        highway_cuts = [c for c in clips if c.start_sec >= 24.0]
-        assert len(highway_cuts) <= 1, f"Duplicate-looking highway cuts selected: {highway_cuts}"
+        # 같은 주행 안의 거의 같은 고속도로 장면은 한 번만 (컷끼리 배경이 겹치지 않게)
+        for info in (info1, info2):
+            same = [c for c in clips if c.video is info and c.start_sec >= 22.0]
+            assert len(same) <= 1, f"Duplicate-looking cruise cuts from one drive: {same}"
         assert all("appear" in i.feature_cache for i in (info1, info2)), "Analysis should store appearance thumbnails"
-        print("[PASS] Highlight selection (skips stops, no duplicate-looking cuts, chronological) verified!")
+        print("[PASS] Highlight selection (calm cruise cuts, no turns/stops, no duplicate-looking cuts) verified!")
 
         # 2) 수동 잘라내기 구간은 하이라이트에서 제외되어야 함
         apply_global_timeline_override([info1, info2], 14.0, 24.0, SegmentType.MANUAL_CUT)
