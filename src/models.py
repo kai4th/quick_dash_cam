@@ -326,6 +326,8 @@ class HighlightClip:
     included: bool = True   # 사용자가 목록에서 제외하면 False
     ai_score: Optional[float] = None  # Claude가 매긴 점수 (0~10), AI 선정을 쓰지 않으면 None
     caption: str = ""       # Claude가 제안한 장면 자막 (쇼츠 화면에 표시 가능)
+    roll_adjust: Optional[float] = None  # 수동 기울기 보정(도, +=시계 방향 회전). None이면 자동 보정 설정을 따름
+    vp: Optional[Tuple[float, float]] = None  # 사용자가 찍은 소실점 (원본 화면 기준 0~1 좌표)
 
     @property
     def duration(self) -> float:

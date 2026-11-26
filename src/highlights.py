@@ -1049,20 +1049,122 @@ def estimate_roll_angle(
     return angle, conf
 
 
-def _level_chain(v: VideoFileInfo, deg: float, out_w: int, out_h: int) -> str:
-    """기울기 deg만큼 반대로 돌리고, 모서리 빈 공간이 안 보이게 살짝 확대해 원래 비율로 잘라내는 필터."""
-    if abs(deg) < ROLL_MIN_APPLY_DEG or v.width <= 0 or v.height <= 0:
+# ── 컷별 화면 맞춤(기울기 + 소실점) ──
+
+MAX_REFRAME_ZOOM = 2.0
+
+
+def vp_target_for(clips: List[HighlightClip]) -> Optional[Tuple[float, float]]:
+    """
+    소실점을 맞출 목표 위치 (0~1 좌표). 가로는 화면 중앙, 높이는 소실점을 찍은 컷들의 중앙값
+    — 컷이 바뀌어도 도로가 같은 곳으로 뻗어 화면이 안정돼 보이게 함.
+    """
+    ys = [c.vp[1] for c in clips if c.included and c.vp is not None]
+    if not ys:
+        return None
+    return 0.5, float(np.median(ys))
+
+
+def reframe_geometry(
+    w: float,
+    h: float,
+    roll_deg: float,
+    vp: Optional[Tuple[float, float]],
+    target: Optional[Tuple[float, float]],
+) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    화면 맞춤 변환: 출력 = s·R·(x − p) + t
+    - R: roll_deg만큼 시계 방향 회전 (화면 좌표는 y가 아래로 증가)
+    - p: 원본의 소실점(없으면 화면 중심), t: 출력에서 소실점이 올 위치(없으면 회전만)
+    - s: 회전·이동 후에도 가장자리에 빈 공간이 생기지 않는 최소 확대율 (최대 MAX_REFRAME_ZOOM,
+      넘으면 이동량을 줄여 맞춤)
+    반환: (s, R, p, t) — 모두 픽셀 단위
+    """
+    th = math.radians(roll_deg)
+    R = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    Rinv = R.T
+    c = np.array([w / 2.0, h / 2.0])
+    if vp is not None and target is not None:
+        p = np.array([vp[0] * w, vp[1] * h])
+        t_full = np.array([target[0] * w, target[1] * h])
+    else:
+        p, t_full = c.copy(), c.copy()
+    p_rot = c + R @ (p - c)  # 이동 없이 회전만 했을 때 소실점 위치
+    corners = [np.array([0.0, 0.0]), np.array([w, 0.0]), np.array([0.0, h]), np.array([w, h])]
+
+    def needed_zoom(t: np.ndarray) -> float:
+        s_req = 1.0
+        for q in corners:
+            v = Rinv @ (q - t)  # 출력 모서리 q에 대응하는 원본 위치 = p + v/s
+            for k, lim in ((0, w), (1, h)):
+                if v[k] > 1e-9:
+                    room = lim - p[k]
+                    s_req = max(s_req, v[k] / room if room > 1e-6 else float("inf"))
+                elif v[k] < -1e-9:
+                    room = p[k]
+                    s_req = max(s_req, -v[k] / room if room > 1e-6 else float("inf"))
+        return s_req
+
+    s = needed_zoom(t_full)
+    t = t_full
+    if s > MAX_REFRAME_ZOOM:
+        # 목표까지 다 옮기면 너무 크게 확대해야 함 → 확대 한도 안에서 가능한 만큼만 이동
+        lo, hi = 0.0, 1.0
+        for _ in range(30):
+            mid = (lo + hi) / 2.0
+            if needed_zoom(p_rot + mid * (t_full - p_rot)) <= MAX_REFRAME_ZOOM:
+                lo = mid
+            else:
+                hi = mid
+        t = p_rot + lo * (t_full - p_rot)
+        s = min(MAX_REFRAME_ZOOM, needed_zoom(t))
+    return s, R, p, t
+
+
+def reframe_affine(w: int, h: int, roll_deg: float, vp, target) -> np.ndarray:
+    """미리보기용 2x3 아핀 행렬 (원본 → 출력). cv2.warpAffine에 그대로 사용."""
+    s, R, p, t = reframe_geometry(w, h, roll_deg, vp, target)
+    A = s * R
+    return np.hstack([A, (t - A @ p).reshape(2, 1)])
+
+
+def reframe_inverse_point(w: int, h: int, roll_deg: float, vp, target, qx: float, qy: float) -> Tuple[float, float]:
+    """출력(미리보기) 화면의 점 → 원본 화면의 점 (픽셀). 미리보기에서 찍은 소실점을 원본 좌표로 바꿀 때 사용."""
+    s, R, p, t = reframe_geometry(w, h, roll_deg, vp, target)
+    x = p + R.T @ (np.array([qx, qy]) - t) / s
+    return float(x[0]), float(x[1])
+
+
+def _reframe_chain(
+    v: VideoFileInfo,
+    roll_deg: float,
+    vp: Optional[Tuple[float, float]],
+    target: Optional[Tuple[float, float]],
+    out_w: int,
+    out_h: int,
+) -> str:
+    """컷별 화면 맞춤을 FFmpeg 필터로: 회전(rotate) → 소실점이 목표에 오도록 잘라내기(crop) → 원래 크기로(scale)."""
+    if v.width <= 0 or v.height <= 0:
         return ""
-    pw = int(min(v.width, max(640, out_w, out_h))) // 2 * 2  # 4K 원본은 먼저 줄여서 회전 비용 절감
+    use_vp = vp is not None and target is not None
+    if abs(roll_deg) < 0.05 and not use_vp:
+        return ""
+    pw = int(min(v.width, max(640, out_w, out_h))) // 2 * 2  # 4K 원본은 출력 크기에 맞춰 먼저 줄여 연산량 절감
     ph = max(2, int(round(pw * v.height / v.width / 2)) * 2)
-    th = math.radians(abs(deg))
-    zoom = math.cos(th) + max(pw / ph, ph / pw) * math.sin(th)
-    zw, zh = int(math.ceil(pw * zoom / 2)) * 2, int(math.ceil(ph * zoom / 2)) * 2
-    # rotate 필터는 양수=시계 방향 → 감지된 기울기의 반대 방향으로 회전
-    return (
-        f"scale={pw}:{ph}:flags=lanczos,rotate={-math.radians(deg):.6f}:ow=iw:oh=ih:c=black,"
-        f"scale={zw}:{zh}:flags=lanczos,crop={pw}:{ph}"
-    )
+    s, R, p, t = reframe_geometry(pw, ph, roll_deg, vp, target)
+    c = np.array([pw / 2.0, ph / 2.0])
+    p_rot = c + R @ (p - c)
+    cw = max(2, int(round(pw / s / 2)) * 2)
+    ch = max(2, int(round(ph / s / 2)) * 2)
+    tl = p_rot - t / s
+    x = int(round(min(max(0.0, tl[0]), pw - cw)))
+    y = int(round(min(max(0.0, tl[1]), ph - ch)))
+    chain = f"scale={pw}:{ph}:flags=lanczos"
+    if abs(roll_deg) >= 0.05:
+        # rotate 필터는 양수=시계 방향
+        chain += f",rotate={math.radians(roll_deg):.6f}:ow=iw:oh=ih:c=black"
+    chain += f",crop={cw}:{ch}:{x}:{y},scale={pw}:{ph}:flags=lanczos"
+    return chain
 
 
 def _build_clip_filtergraph(
@@ -1081,10 +1183,10 @@ def _build_clip_filtergraph(
     fade_in: float = 0.0,
     fade_out: float = 0.0,
     overlay_window: Optional[Tuple[float, float]] = None,
-    level_deg: float = 0.0,
+    reframe: str = "",
 ) -> str:
     v = clip.video
-    level = _level_chain(v, level_deg, out_w, out_h)
+    level = reframe  # 컷별 화면 맞춤(기울기·소실점) 필터
     prefix = f"[0:v]{level}[lv];" if level else ""
     src = "[lv]" if level else "[0:v]"
     if cfg.layout == ShortsLayout.VERTICAL_BLUR:
@@ -1202,12 +1304,12 @@ def _encode_highlight_clip(
     fade_in: float = 0.0,
     fade_out: float = 0.0,
     overlay_window: Optional[Tuple[float, float]] = None,
-    level_deg: float = 0.0,
+    reframe: str = "",
 ) -> Tuple[bool, str]:
     dur = clip.duration if dur is None else dur
     graph = _build_clip_filtergraph(
         clip, cfg, out_w, out_h, dur, title_file, cfg.title_text.strip(), ts_file, font_title, font_ts,
-        caption_file, font_caption, fade_in, fade_out, overlay_window, level_deg,
+        caption_file, font_caption, fade_in, fade_out, overlay_window, reframe,
     )
     cmd: List[str] = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -1402,34 +1504,47 @@ def render_highlight_shorts(
     done_dur = 0.0
     encode_share = 0.8 if use_xfade else 0.9
 
-    # 수평 자동 보정: 컷마다 그 구간의 프레임으로 기울기를 추정하고, 불확실하면 영상 전체 추정값, 그것도 불확실하면 그대로
-    level_by_clip: List[float] = [0.0] * n
-    if cfg.auto_level:
-        video_angle: Dict[int, Tuple[float, float]] = {}
-        for idx, c in enumerate(use_clips):
+    # 컷별 화면 맞춤: 수동 기울기(사용자가 조정한 값)가 우선, 없으면 (켜져 있을 때) 자동 수평 보정,
+    # 소실점을 찍은 컷은 소실점이 모든 컷 공통 목표 위치에 오도록 이동·확대
+    roll_by_clip: List[float] = [0.0] * n  # 회전 보정 각도 (+=시계 방향)
+    vp_target = vp_target_for(use_clips)
+    video_angle: Dict[int, Tuple[float, float]] = {}
+    for idx, c in enumerate(use_clips):
+        mm, ss = divmod(int(c.start_sec), 60)
+        where = f"컷 {idx + 1} ({c.video.filename} {mm}:{ss:02d})"
+        vp_txt = " · 소실점 맞춤" if (c.vp is not None and vp_target is not None) else ""
+        if c.roll_adjust is not None:
+            roll_by_clip[idx] = c.roll_adjust
+            if notes is not None and (abs(c.roll_adjust) >= 0.05 or vp_txt):
+                notes.append(f"화면 맞춤: {where} 기울기 {c.roll_adjust:+.1f}° (수동){vp_txt}")
+            continue
+        if cfg.auto_level:
             if cancel_check and cancel_check():
                 raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
             if progress_callback:
                 progress_callback(0.0, f"수평(지평선) 기울기 확인 중 [{idx + 1}/{n}]: {c.video.filename} {c.start_sec:.0f}초~")
             cut_angle = estimate_clip_roll(c, cancel_check)
             if cut_angle is not None:
-                angle, how = cut_angle, "컷 기준"
+                angle, how = cut_angle, "자동·컷 기준"
             else:
                 if id(c.video) not in video_angle:
                     video_angle[id(c.video)] = estimate_roll_angle(c.video, cancel_check)
                 v_angle, v_conf = video_angle[id(c.video)]
                 # 영상 전체 프레임이 거의 같은 각도로 일치할 때만 대신 사용 (카메라가 중간에 돌아간 영상이면 잘못 돌릴 수 있음)
-                angle, how = (v_angle, "영상 전체 기준") if v_conf >= VIDEO_ROLL_TRUST else (0.0, "판단 어려움")
-            level_by_clip[idx] = angle if abs(angle) >= ROLL_MIN_APPLY_DEG else 0.0
+                angle, how = (v_angle, "자동·영상 전체 기준") if v_conf >= VIDEO_ROLL_TRUST else (0.0, "판단 어려움")
+            if abs(angle) >= ROLL_MIN_APPLY_DEG:
+                roll_by_clip[idx] = -angle  # 감지된 기울기의 반대 방향으로 회전
             if notes is not None:
-                mm, ss = divmod(int(c.start_sec), 60)
-                where = f"컷 {idx + 1} ({c.video.filename} {mm}:{ss:02d})"
                 if how == "판단 어려움":
-                    notes.append(f"수평: {where} 직선이 부족해 그대로 둠")
+                    notes.append(f"수평: {where} 직선이 부족해 그대로 둠{vp_txt}")
                 elif abs(angle) >= ROLL_MIN_APPLY_DEG:
-                    notes.append(f"수평: {where} {angle:+.1f}° 보정 ({how})")
-        if notes is not None and not any(n_.startswith("수평:") for n_ in notes):
-            notes.append("수평: 모든 컷이 이미 수평이라 보정하지 않음")
+                    notes.append(f"수평: {where} {angle:+.1f}° 보정 ({how}){vp_txt}")
+                elif vp_txt:
+                    notes.append(f"화면 맞춤: {where}{vp_txt}")
+        elif notes is not None and vp_txt:
+            notes.append(f"화면 맞춤: {where}{vp_txt}")
+    if cfg.auto_level and notes is not None and not any(n_.startswith(("수평:", "화면 맞춤:")) for n_ in notes):
+        notes.append("수평: 모든 컷이 이미 수평이라 보정하지 않음")
 
     with tempfile.TemporaryDirectory(prefix="quick_dash_cam_shorts_") as tmp_str:
         tmp = Path(tmp_str)
@@ -1470,7 +1585,7 @@ def render_highlight_shorts(
                 fade_in=cfg.fade_sec if idx == 0 else 0.0,
                 fade_out=cfg.fade_sec if idx == n - 1 else 0.0,
                 overlay_window=(t_in + 0.15, seg_durs[idx] - t_out - 0.1),
-                level_deg=level_by_clip[idx],
+                reframe=_reframe_chain(clip.video, roll_by_clip[idx], clip.vp, vp_target, out_w, out_h),
             )
             ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra, **timing)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):

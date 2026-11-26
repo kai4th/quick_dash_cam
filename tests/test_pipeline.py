@@ -511,10 +511,70 @@ def test_horizon_leveling_and_quality() -> None:
         print("[PASS] Per-cut leveling: only the tilted cut is corrected when the camera moved mid-drive")
 
 
+def test_manual_reframe() -> None:
+    """컷별 수동 맞춤: 소실점이 목표 위치로 이동(렌더 = 미리보기), 빈 모서리 없음, 수동 기울기 적용."""
+    import cv2
+    from src.highlights import _reframe_chain, frame_roll_estimate, reframe_affine, reframe_inverse_point, vp_target_for
+
+    with tempfile.TemporaryDirectory(prefix="qdc_reframe_") as tmp:
+        tmp_dir = Path(tmp)
+        W, H = 640, 360
+        img = np.full((H, W, 3), 40, np.uint8)
+        cv2.circle(img, (int(0.62 * W), int(0.38 * H)), 5, (255, 255, 255), -1)
+        dot = tmp_dir / "dot.png"
+        cv2.imwrite(str(dot), img)
+        v = VideoFileInfo(path=dot, filename="dot.png", width=W, height=H, duration_sec=1.0)
+        c1 = HighlightClip(v, 0, 1, vp=(0.62, 0.38), roll_adjust=1.5)
+        c2 = HighlightClip(v, 0, 1, vp=(0.48, 0.46))
+        target = vp_target_for([c1, c2])
+        assert target is not None and abs(target[0] - 0.5) < 1e-9 and abs(target[1] - 0.42) < 1e-9, target
+
+        def find_dot(im):
+            g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+            ys, xs = np.where(g > 200)
+            return float(xs.mean()), float(ys.mean())
+
+        out_png = tmp_dir / "dot_out.png"
+        subprocess.run([get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(dot), "-vf",
+                        _reframe_chain(v, 1.5, c1.vp, target, W, H), str(out_png)],
+                       check=True, creationflags=get_CreationFlags())
+        rendered = cv2.imread(str(out_png))
+        rx, ry = find_dot(rendered)
+        px, py = find_dot(cv2.warpAffine(img, reframe_affine(W, H, 1.5, c1.vp, target), (W, H)))
+        assert abs(rx - 0.5 * W) < 4 and abs(ry - 0.42 * H) < 4, (rx, ry)
+        assert abs(rx - px) < 3 and abs(ry - py) < 3, "preview must match the render"
+        assert int(rendered.min()) > 5, "no empty (black) corners after rotate/shift"
+        sx, sy = reframe_inverse_point(W, H, 1.5, c1.vp, target, 0.5 * W, 0.42 * H)
+        assert abs(sx - 0.62 * W) < 1 and abs(sy - 0.38 * H) < 1, "clicked preview point maps back to the source"
+        print(f"[PASS] Vanishing point moved to target (render {rx:.0f},{ry:.0f} / preview {px:.0f},{py:.0f})")
+
+        src = tmp_dir / "VID_20261024_090000.mp4"
+        _create_synthetic_driving_video(src, duration_sec=32, fps=20)
+        rot = tmp_dir / "rot.mp4"
+        subprocess.run([get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-vf",
+                        "rotate=3*PI/180:ow=iw:oh=ih:c=black,scale=iw*1.12:-2,crop=640:360",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy", str(rot)],
+                       check=True, creationflags=get_CreationFlags())
+        rv = probe_video_file(rot)
+        out = tmp_dir / "manual.mp4"
+        notes: list = []
+        render_highlight_shorts([HighlightClip(rv, 16.0, 19.0, roll_adjust=-3.0)], ShortsExportConfig(
+            output_path=out, layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False,
+        ), notes=notes)
+        raw = subprocess.run([get_ffmpeg_exe(), "-loglevel", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1",
+                              "-vf", "scale=640:360", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                             stdout=subprocess.PIPE, check=True, creationflags=get_CreationFlags()).stdout
+        after, _n = frame_roll_estimate(np.frombuffer(raw, dtype=np.uint8).reshape(360, 640))
+        assert after is not None and abs(after) < 0.6, after
+        assert notes and "수동" in notes[0], notes
+        print("[PASS] Manual per-cut roll (-3.0° on a +3° tilted cut -> level)")
+
+
 if __name__ == "__main__":
     test_sorter()
     test_analysis_and_export()
     test_highlight_shorts()
     test_shorts_transitions()
     test_horizon_leveling_and_quality()
+    test_manual_reframe()
     print("ALL TESTS PASSED SUCCESSFULLY!")

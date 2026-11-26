@@ -19,7 +19,16 @@ import numpy as np
 
 from .ai_director import AiDirectorError, ai_select_highlights, find_claude_cli
 from .analyzer import analyze_video, reclassify_from_cache
-from .highlights import ensure_appearance, ensure_audio_levels, render_highlight_shorts, select_highlights
+from .highlights import (
+    ensure_appearance,
+    ensure_audio_levels,
+    reframe_affine,
+    reframe_geometry,
+    reframe_inverse_point,
+    render_highlight_shorts,
+    select_highlights,
+    vp_target_for,
+)
 from .ffmpeg_utils import (
     VIDEO_EXTENSIONS,
     detect_best_gpu_decoder,
@@ -1015,6 +1024,9 @@ class QuickDashCamApp(ctk.CTk):
         self._hl_play_queue: List[int] = []
         self._anthropic_api_key: Optional[str] = None  # 이번 실행 동안만 메모리에 보관 (디스크 저장 안 함)
         self._ai_consent_given: bool = False
+        self._vp_pick_mode: bool = False  # 미리보기 클릭으로 소실점 지정 대기 중
+        self._last_preview_raw: Optional[np.ndarray] = None  # 화면 맞춤 적용 전 마지막 미리보기 프레임
+        self._preview_geom: Optional[Tuple[int, int, int, int]] = None  # 미리보기 이미지 위치 (x0, y0, w, h)
 
         self._preview_worker = PreviewFrameWorker(self._on_worker_frame_ready)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1155,6 +1167,7 @@ class QuickDashCamApp(ctk.CTk):
         )
         self.preview_canvas.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
         self.preview_canvas.bind("<Configure>", lambda _e: self._request_current_preview_frame())
+        self.preview_canvas.bind("<Button-1>", self._on_preview_click)
 
         # 우측: 타임라인 탐색 컨트롤 & 구간 잘라내기 도구함
         cut_panel = ctk.CTkFrame(editor_frame, fg_color="#1e293b", corner_radius=6)
@@ -2188,6 +2201,10 @@ class QuickDashCamApp(ctk.CTk):
             pass
 
     def _draw_preview_image(self, img_or_arr: Union[np.ndarray, object]) -> None:
+        reframe_info = None
+        if isinstance(img_or_arr, np.ndarray):
+            self._last_preview_raw = img_or_arr
+            img_or_arr, reframe_info = self._apply_preview_reframe(img_or_arr)
         self._preview_photo = make_photo_image(img_or_arr)
         cw = self.preview_canvas.winfo_width()
         ch = self.preview_canvas.winfo_height()
@@ -2199,6 +2216,12 @@ class QuickDashCamApp(ctk.CTk):
         self.preview_canvas.create_image(
             cw // 2, ch // 2, image=self._preview_photo, anchor="center"
         )
+        if isinstance(img_or_arr, np.ndarray):
+            ih, iw = img_or_arr.shape[:2]
+            x0, y0 = cw // 2 - iw // 2, ch // 2 - ih // 2
+            self._preview_geom = (x0, y0, iw, ih)
+            if reframe_info is not None:
+                self._draw_reframe_guides(reframe_info, x0, y0, iw, ih)
 
         # 현재 위치가 수동 잘라내기(삭제) 또는 스킵 구간인 경우 프리뷰 상단에 배지 오버레이 표시
         mapped = map_global_time_to_clip(self.videos, self.playhead_sec)
@@ -2845,13 +2868,40 @@ class QuickDashCamApp(ctk.CTk):
         )
         self.shorts_info_label.grid(row=1, column=0, columnspan=5, sticky="ew", padx=2, pady=(2, 0))
 
+        adjust = ctk.CTkFrame(actions, fg_color="#0f172a", corner_radius=6)
+        adjust.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(2, 0))
+        ctk.CTkLabel(adjust, text="🎯 선택한 컷 맞춤", font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(6, 6))
+        for txt, cmd, wdt in (
+            ("↺ 0.5°", lambda: self._shorts_rotate(-0.5), 58),
+            ("↻ 0.5°", lambda: self._shorts_rotate(0.5), 58),
+        ):
+            ctk.CTkButton(
+                adjust, text=txt, width=wdt, height=24, font=ctk.CTkFont(size=11),
+                fg_color="#334155", hover_color="#475569", command=cmd,
+            ).pack(side="left", padx=1, pady=3)
+        self.btn_vp_pick = ctk.CTkButton(
+            adjust, text="📍 소실점 찍기", width=104, height=24, font=ctk.CTkFont(size=11),
+            fg_color="#0e7490", hover_color="#155e75", command=self._shorts_toggle_vp_pick,
+        )
+        self.btn_vp_pick.pack(side="left", padx=(4, 1), pady=3)
+        ctk.CTkButton(
+            adjust, text="초기화", width=54, height=24, font=ctk.CTkFont(size=11),
+            fg_color="#1e293b", hover_color="#334155", border_width=1, border_color="#475569",
+            command=self._shorts_reset_adjust,
+        ).pack(side="left", padx=(4, 1), pady=3)
+        self.shorts_adjust_label = ctk.CTkLabel(
+            adjust, text="컷을 고르면 미리보기에 결과·기준선이 표시됩니다", font=ctk.CTkFont(size=10),
+            text_color="#94a3b8", anchor="w",
+        )
+        self.shorts_adjust_label.pack(side="left", padx=(8, 4), fill="x", expand=True)
+
         tree_box = ctk.CTkFrame(parent, fg_color="#1e293b", corner_radius=6)
         tree_box.grid(row=2, column=0, sticky="nsew")
         tree_box.grid_columnconfigure(0, weight=1)
         tree_box.grid_rowconfigure(0, weight=1)
 
         scaling = ctk.ScalingTracker.get_widget_scaling(self)
-        columns = ("no", "use", "start", "dur", "clip", "reason", "caption", "score")
+        columns = ("no", "use", "start", "dur", "clip", "reason", "caption", "adj", "score")
         self.shorts_tree = ttk.Treeview(
             tree_box, columns=columns, show="headings", height=4,
             style="Review.Treeview", selectmode="browse",
@@ -2864,6 +2914,7 @@ class QuickDashCamApp(ctk.CTk):
             ("clip", "클립", 48, "center"),
             ("reason", "장면 설명", 120, "w"),
             ("caption", "자막", 100, "w"),
+            ("adj", "맞춤", 70, "center"),
             ("score", "점수", 110, "w"),
         ]:
             self.shorts_tree.heading(col, text=txt)
@@ -3036,7 +3087,7 @@ class QuickDashCamApp(ctk.CTk):
                 values=(
                     i + 1, "✔ 사용" if c.included else "✕ 제외", format_duration(g[0], True),
                     f"{c.duration:.1f}초", f"#{clip_no.get(id(c.video), '?')}", c.reason or "-",
-                    c.caption or "-", score_txt,
+                    c.caption or "-", self._adjust_text(c), score_txt,
                 ),
                 tags=("on" if c.included else "off",),
             )
@@ -3127,6 +3178,147 @@ class QuickDashCamApp(ctk.CTk):
             self._playback.stop()
             self._launch_playback()
             return
+
+    # 컷별 화면 맞춤 (기울기 · 소실점)
+
+    @staticmethod
+    def _adjust_text(c: HighlightClip) -> str:
+        parts: List[str] = []
+        if c.roll_adjust is not None and abs(c.roll_adjust) >= 0.05:
+            parts.append(f"{c.roll_adjust:+.1f}°")
+        if c.vp is not None:
+            parts.append("⌖")
+        return " ".join(parts) or "-"
+
+    def _shorts_selected_clip(self) -> Optional[HighlightClip]:
+        idx = self.highlight_index
+        if idx is None or not (0 <= idx < len(self.highlight_clips)):
+            return None
+        return self.highlight_clips[idx]
+
+    def _shorts_adjust_context(self) -> Optional[Tuple[HighlightClip, Optional[Tuple[float, float]]]]:
+        """쇼츠 탭에서 선택한 컷을 보고 있을 때만 (컷, 소실점 목표) — 미리보기에 화면 맞춤을 적용할 조건."""
+        if not hasattr(self, "left_tabs") or self.left_tabs.get() != TAB_SHORTS:
+            return None
+        clip = self._shorts_selected_clip()
+        if clip is None:
+            return None
+        g = self._hl_global(clip)
+        if g is None or not (g[0] - 0.3 <= self.playhead_sec <= g[1] + 0.6):
+            return None
+        return clip, vp_target_for(self.highlight_clips)
+
+    def _shorts_show_selected_frame(self) -> None:
+        """조정할 컷의 가운데 프레임을 멈춘 상태로 보여줌 (소실점은 멈춘 화면에서 찍어야 정확)."""
+        clip = self._shorts_selected_clip()
+        g = self._hl_global(clip) if clip is not None else None
+        if g is None:
+            return
+        self._stop_preview_play()
+        if not (g[0] <= self.playhead_sec <= g[1]):
+            self.playhead_sec = (g[0] + g[1]) / 2.0
+            self._update_timeline_and_preview()
+
+    def _shorts_after_adjust(self) -> None:
+        self._refresh_shorts_ui()
+        if self._last_preview_raw is not None and not self.is_playing_preview and self._shorts_adjust_context():
+            self._draw_preview_image(self._last_preview_raw)
+        else:
+            self._request_current_preview_frame()
+
+    def _shorts_rotate(self, delta: float) -> None:
+        clip = self._shorts_selected_clip()
+        if clip is None:
+            self.shorts_adjust_label.configure(text="먼저 목록에서 맞출 컷을 선택하세요")
+            return
+        self._shorts_show_selected_frame()
+        clip.roll_adjust = round((clip.roll_adjust or 0.0) + delta, 2)
+        self._shorts_after_adjust()
+
+    def _shorts_toggle_vp_pick(self) -> None:
+        clip = self._shorts_selected_clip()
+        if clip is None:
+            self.shorts_adjust_label.configure(text="먼저 목록에서 맞출 컷을 선택하세요")
+            return
+        self._vp_pick_mode = not self._vp_pick_mode
+        if self._vp_pick_mode:
+            self._shorts_show_selected_frame()
+            self.btn_vp_pick.configure(text="📍 클릭 대기 중…", fg_color="#ca8a04")
+            self.preview_canvas.configure(cursor="crosshair")
+        else:
+            self.btn_vp_pick.configure(text="📍 소실점 찍기", fg_color="#0e7490")
+            self.preview_canvas.configure(cursor="")
+        self._shorts_after_adjust()
+
+    def _shorts_reset_adjust(self) -> None:
+        clip = self._shorts_selected_clip()
+        if clip is None:
+            return
+        clip.roll_adjust = None
+        clip.vp = None
+        if self._vp_pick_mode:
+            self._shorts_toggle_vp_pick()
+        self._shorts_after_adjust()
+
+    def _on_preview_click(self, event) -> None:
+        if not self._vp_pick_mode:
+            return
+        ctx = self._shorts_adjust_context()
+        if ctx is None or self._preview_geom is None:
+            return
+        clip, target = ctx
+        x0, y0, w, h = self._preview_geom
+        qx, qy = event.x - x0, event.y - y0
+        if not (0 <= qx < w and 0 <= qy < h):
+            return
+        # 화면에 보이는(이미 맞춤이 적용된) 위치 → 원본 화면 위치로 되돌려 저장
+        sx, sy = reframe_inverse_point(w, h, clip.roll_adjust or 0.0, clip.vp, target, qx, qy)
+        clip.vp = (min(0.98, max(0.02, sx / w)), min(0.98, max(0.02, sy / h)))
+        self._shorts_toggle_vp_pick()  # 클릭 한 번으로 지정 완료
+
+    def _apply_preview_reframe(self, arr: np.ndarray) -> Tuple[np.ndarray, Optional[Tuple[HighlightClip, Optional[Tuple[float, float]], float]]]:
+        """미리보기 프레임에 선택한 컷의 화면 맞춤을 적용. 반환: (그릴 프레임, (컷, 목표, 확대율) 또는 None)."""
+        ctx = self._shorts_adjust_context()
+        if ctx is None:
+            return arr, None
+        clip, target = ctx
+        roll = clip.roll_adjust or 0.0
+        h, w = arr.shape[:2]
+        zoom = 1.0
+        if abs(roll) >= 0.05 or (clip.vp is not None and target is not None):
+            zoom = reframe_geometry(w, h, roll, clip.vp, target)[0]
+            M = reframe_affine(w, h, roll, clip.vp, target)
+            arr = cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        return arr, (clip, target, zoom)
+
+    def _draw_reframe_guides(self, info, x0: int, y0: int, w: int, h: int) -> None:
+        clip, target, zoom = info
+        cv_ = self.preview_canvas
+        # 수평 확인용 옅은 가로선 + 화면 중앙 세로선
+        for k in range(1, 6):
+            y = y0 + h * k / 6.0
+            cv_.create_line(x0, y, x0 + w, y, fill="#e2e8f0", width=1, dash=(2, 6))
+        cv_.create_line(x0 + w / 2.0, y0, x0 + w / 2.0, y0 + h, fill="#e2e8f0", width=1, dash=(2, 6))
+        if target is not None:
+            tx, ty = x0 + target[0] * w, y0 + target[1] * h
+            cv_.create_line(x0, ty, x0 + w, ty, fill="#22d3ee", width=1)
+            cv_.create_oval(tx - 9, ty - 9, tx + 9, ty + 9, outline="#22d3ee", width=2)
+        idx = self.highlight_index if self.highlight_index is not None else 0
+        roll = clip.roll_adjust or 0.0
+        txt = f"🎯 컷 {idx + 1} 맞춤  기울기 {roll:+.1f}°"
+        if clip.vp is not None:
+            txt += "  ·  소실점 맞춤"
+        if zoom > 1.005:
+            txt += f"  ·  확대 {zoom:.2f}×"
+        if self._vp_pick_mode:
+            txt = "📍 소실점(도로가 한 점으로 모이는 곳)을 클릭하세요"
+        cv_.create_rectangle(x0 + 4, y0 + h - 24, x0 + 8 + len(txt) * 7, y0 + h - 4, fill="#0f172a", outline="")
+        cv_.create_text(x0 + 8, y0 + h - 14, text=txt, anchor="w", fill="#facc15", font=("Malgun Gothic", 9, "bold"))
+        self.shorts_adjust_label.configure(
+            text=(f"컷 {idx + 1}: 기울기 {roll:+.1f}°" + (" · 소실점 지정됨" if clip.vp is not None else " · 소실점 미지정")
+                  + (f" · 확대 {zoom:.2f}×" if zoom > 1.005 else "")
+                  + "  —  하늘색 원 = 모든 컷의 소실점이 모일 위치")
+        )
 
     # 하이라이트 찾기 / 쇼츠 만들기
 
