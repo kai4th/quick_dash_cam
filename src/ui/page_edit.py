@@ -256,7 +256,10 @@ class EditPage(ctk.CTkFrame):
         mapped = map_global_time_to_clip(self.store.videos, t)
         if mapped is not None:
             idx, v, local_t, _seg = mapped
-            self.clip_label.configure(text=f"클립 #{idx + 1} {v.filename}  {format_duration(local_t, True)}")
+            text = f"클립 #{idx + 1} {v.filename}  {format_duration(local_t, True)}"
+            if text != getattr(self, "_clip_text", None):  # 재생 중 매 프레임 라벨 갱신 비용 줄이기
+                self._clip_text = text
+                self.clip_label.configure(text=text)
 
     def _on_timeline_seek(self, t: float) -> None:
         self.player.seek(t)

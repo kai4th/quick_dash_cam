@@ -16,7 +16,7 @@ from typing import Callable, List, Optional, Tuple
 import customtkinter as ctk
 import numpy as np
 
-from .media import PlaybackClip, PlaybackWorker, PreviewFrameWorker
+from .media import PlaybackClip, PlaybackWorker, PlayPiece, PreviewFrameWorker, build_pieces
 from .theme import BG_DEEP, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, ACCENT, ACCENT_HOVER, font, format_duration, make_photo_image
 
 RATES = ["0.5x", "1x", "2x", "4x", "8x"]
@@ -44,8 +44,11 @@ class VideoPlayer(ctk.CTkFrame):
         self._session: int = -1
         self._restart_job: Optional[str] = None
         self._resize_job: Optional[str] = None
+        self._poll_job: Optional[str] = None
         self._raw: Optional[np.ndarray] = None
         self._photo: Optional[tk.PhotoImage] = None
+        self._photo_size: Tuple[int, int] = (0, 0)
+        self._img_item: Optional[int] = None
         self.image_geom: Optional[Tuple[int, int, int, int]] = None  # (x0, y0, w, h)
         self._last_label = 0.0
 
@@ -106,6 +109,9 @@ class VideoPlayer(ctk.CTkFrame):
 
     def seek(self, t: float) -> None:
         self.position = max(0.0, min(self.total, t))
+        if self._segments:  # 컷 이어보기 중 다른 곳으로 이동하면 일반 재생으로 전환
+            self._segments = []
+            self._stop_at = None
         if self.playing:
             self._playback.stop()
             self._schedule_restart()
@@ -165,7 +171,7 @@ class VideoPlayer(ctk.CTkFrame):
         self.playing = True
         self._set_play_button()
         self._launch()
-        self._poll()
+        self._start_poll()
 
     def play_range(self, start: float, end: float) -> None:
         self._segments = []
@@ -174,31 +180,20 @@ class VideoPlayer(ctk.CTkFrame):
         self.play(stop_at=end)
 
     def play_segments(self, segments: List[Tuple[float, float]]) -> None:
-        """여러 구간을 차례로 이어서 재생 (쇼츠 미리보기)."""
+        """여러 구간을 차례로 이어서 재생 (쇼츠 미리보기). 다음 컷은 재생 워커가 미리 열어 두어 바로 이어집니다."""
         self.stop()
-        self._segments = list(segments)
-        self._seg_index = -1
-        self._next_segment()
-
-    def _next_segment(self) -> bool:
-        self._seg_index += 1
-        if self._seg_index >= len(self._segments):
-            self._segments = []
-            return False
-        g0, g1 = self._segments[self._seg_index]
+        segs = [(max(0.0, a), min(self.total, b)) for a, b in segments if b - a > 0.05]
+        if not segs or not self.clips:
+            return
+        self._segments = segs
+        self._seg_index = 0
+        self.position, self._stop_at = segs[0]
         if self.on_segment_start:
-            self.on_segment_start(self._seg_index)
-        self.position = g0
-        self._stop_at = g1
-        if not self.playing:
-            self.playing = True
-            self._set_play_button()
-            self._launch()
-            self._poll()
-        else:
-            self._playback.stop()
-            self._launch()
-        return True
+            self.on_segment_start(0)
+        self.playing = True
+        self._set_play_button()
+        self._launch()
+        self._start_poll()
 
     def stop(self) -> None:
         self._segments = []
@@ -214,9 +209,20 @@ class VideoPlayer(ctk.CTkFrame):
             self._set_play_button()
             self.request_frame()
 
+    def _pieces(self) -> List[PlayPiece]:
+        if not self._segments:
+            return build_pieces(self.clips, self.position, self._stop_at)
+        pieces: List[PlayPiece] = []
+        for k in range(max(0, self._seg_index), len(self._segments)):
+            g0, g1 = self._segments[k]
+            if k == self._seg_index:
+                g0 = max(g0, min(self.position, g1 - 0.05))
+            pieces += build_pieces(self.clips, g0, g1, tag=k)
+        return pieces
+
     def _launch(self) -> None:
         self._session = self._playback.start(
-            clips=self.clips, global_start=self.position, stop_at=self._stop_at, rate=self.rate(),
+            self._pieces(), rate=self.rate(),
             box_w=max(160, self.canvas.winfo_width()), box_h=max(90, self.canvas.winfo_height()),
         )
 
@@ -240,23 +246,36 @@ class VideoPlayer(ctk.CTkFrame):
             self._playback.stop()
             self._schedule_restart()
 
+    def _start_poll(self) -> None:
+        """화면 갱신 루프는 항상 하나만 돌도록 (겹치면 그리기가 두 배로 늘어 끊김)."""
+        if self._poll_job is not None:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+        self._poll_job = self.after(1, self._poll)
+
     def _poll(self) -> None:
+        self._poll_job = None
         if not self.playing:
             return
         item = self._playback.take_latest()
         if item is not None:
-            sid, media_t, arr = item
+            sid, media_t, arr, tag = item
             if sid == self._session:
+                if self._segments and tag != self._seg_index and 0 <= tag < len(self._segments):
+                    self._seg_index = tag
+                    self._stop_at = self._segments[tag][1]
+                    if self.on_segment_start:
+                        self.on_segment_start(tag)
                 self.position = media_t
                 self._raw = arr
                 self.redraw()
                 self._update_time_label()
                 if self.on_position:
                     self.on_position(media_t)
-        if self._playback.is_finished(self._session) and self._restart_job is None:
-            if self._segments and self._next_segment():
-                self.after(12, self._poll)
-                return
+        if self._playback.is_finished(self._session) and self._restart_job is None \
+                and not self._playback.has_pending():
             if self._stop_at is not None:
                 self.position = min(self._stop_at, self.total)
             self._segments = []
@@ -266,7 +285,7 @@ class VideoPlayer(ctk.CTkFrame):
             if self.on_position:
                 self.on_position(self.position)
             return
-        self.after(12, self._poll)
+        self._poll_job = self.after(8, self._poll)
 
     def _set_play_button(self) -> None:
         if self.btn_play is not None:
@@ -290,9 +309,10 @@ class VideoPlayer(ctk.CTkFrame):
 
     def redraw(self) -> None:
         cv = self.canvas
-        cv.delete("all")
         cw, ch = max(10, cv.winfo_width()), max(10, cv.winfo_height())
         if self._raw is None:
+            cv.delete("all")
+            self._img_item = None
             self.image_geom = None
             cv.create_text(cw // 2, ch // 2, text=self.empty_text, fill=FG_MUTED, font=("Malgun Gothic", 13),
                            justify="center")
@@ -304,10 +324,26 @@ class VideoPlayer(ctk.CTkFrame):
             except Exception:
                 arr = self._raw
         h, w = arr.shape[:2]
-        self._photo = make_photo_image(arr)
+        # 영상 그림 하나를 계속 재사용 (매 프레임 새로 만들면 그리기 비용이 약 두 배)
+        if self._img_item is not None:
+            cv.addtag_all("old")
+            cv.dtag(self._img_item, "old")
+            cv.delete("old")
+        else:
+            cv.delete("all")
+        if self._photo is not None and self._photo_size == (w, h) and self._img_item is not None:
+            if not arr.flags["C_CONTIGUOUS"]:
+                arr = np.ascontiguousarray(arr)
+            self._photo.put(f"P6 {w} {h} 255\n".encode("ascii") + arr.tobytes())
+            cv.coords(self._img_item, cw // 2, ch // 2)
+        else:
+            if self._img_item is not None:
+                cv.delete(self._img_item)
+            self._photo = make_photo_image(arr)
+            self._photo_size = (w, h)
+            self._img_item = cv.create_image(cw // 2, ch // 2, image=self._photo, anchor="center")
         x0, y0 = cw // 2 - w // 2, ch // 2 - h // 2
         self.image_geom = (x0, y0, w, h)
-        cv.create_image(cw // 2, ch // 2, image=self._photo, anchor="center")
         if self.overlay is not None:
             try:
                 self.overlay(cv, x0, y0, w, h)
@@ -347,5 +383,11 @@ class VideoPlayer(ctk.CTkFrame):
 
     def close(self) -> None:
         self.playing = False
+        for job in (self._poll_job, self._restart_job, self._resize_job):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
         self._playback.stop()
         self._preview.close()

@@ -98,7 +98,7 @@ class AppState:
         clips: List[PlaybackClip] = []
         cursor = 0.0
         for v in self.videos:
-            clips.append(PlaybackClip(v.path, cursor, v.duration_sec, v.width, v.height))
+            clips.append(PlaybackClip(v.path, cursor, v.duration_sec, v.width, v.height, float(v.fps or 0.0)))
             cursor += v.duration_sec
         return clips
 
