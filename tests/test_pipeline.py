@@ -308,19 +308,19 @@ def test_highlight_shorts() -> None:
         print("Highlights:", [(c.video.filename, round(c.start_sec, 1), round(c.end_sec, 1), c.reason) for c in clips])
         assert clips, "Expected at least one highlight clip"
         total = sum(c.duration for c in clips)
-        assert 6.0 <= total <= 9.0, f"Unexpected highlight total duration: {total}"
+        assert 4.0 <= total <= 9.0, f"Unexpected highlight total duration: {total}"
         for c in clips:
             for seg in c.video.segments:
                 if seg.segment_type == SegmentType.STOP:
                     ov = min(c.end_sec, seg.end_sec) - max(c.start_sec, seg.start_sec)
                     assert ov <= 0.3, f"Highlight overlaps traffic-light stop: {c} vs {seg}"
-        in_normal = sum(
-            max(0.0, min(c.end_sec, 23.5) - max(c.start_sec, 14.5)) for c in clips
-        )
-        assert in_normal >= total * 0.5, f"Expected highlights mostly from turning/city driving: {in_normal}/{total}"
         ordered = [(0 if c.video is info1 else 1, c.start_sec) for c in clips]
         assert ordered == sorted(ordered), "Highlights must be in chronological order"
-        print("[PASS] Highlight selection (skips stops, prefers turns/city driving, chronological) verified!")
+        # 두 클립은 같은 영상의 복사본 → 똑같아 보이는 고속도로 장면은 한 번만 (컷끼리 배경이 겹치지 않게)
+        highway_cuts = [c for c in clips if c.start_sec >= 24.0]
+        assert len(highway_cuts) <= 1, f"Duplicate-looking highway cuts selected: {highway_cuts}"
+        assert all("appear" in i.feature_cache for i in (info1, info2)), "Analysis should store appearance thumbnails"
+        print("[PASS] Highlight selection (skips stops, no duplicate-looking cuts, chronological) verified!")
 
         # 2) 수동 잘라내기 구간은 하이라이트에서 제외되어야 함
         apply_global_timeline_override([info1, info2], 14.0, 24.0, SegmentType.MANUAL_CUT)

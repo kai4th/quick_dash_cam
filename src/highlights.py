@@ -273,6 +273,51 @@ def _type_weights(video: VideoFileInfo, ts: np.ndarray, straight_weight: float) 
     return weights, cut
 
 
+TRIP_GAP_SEC = 300.0      # 녹화 시각 사이가 5분 넘게 비면 다른 주행(출발·도착이 따로 있음)으로 봄
+TRIP_EDGE_MAX_SEC = 90.0  # 주행 시작·끝 이 시간만큼은 주차장·골목일 가능성이 높아 점수를 낮춤
+TRIP_EDGE_MIN_FACTOR = 0.3
+
+
+def _trip_edge_factors(
+    videos: List[VideoFileInfo],
+    ts_list: List[Optional[np.ndarray]],
+) -> List[Optional[np.ndarray]]:
+    """
+    주행(trip) 단위로 시작·끝 부근 점수 배율(0.3~1.0)을 계산합니다.
+    출발 직후·도착 직전은 대부분 주차장·골목이라, 가까운 차·기둥이 빠르게 지나가며 '화면 변화'가 커도 볼거리가 아닙니다.
+    촬영 시각을 믿을 수 있는 영상끼리 5분 넘게 비어 있으면 서로 다른 주행으로 나눕니다.
+    """
+    trips: List[List[int]] = []
+    prev_end = None
+    for i, v in enumerate(videos):
+        reliable = v.recorded_at is not None and v.timestamp_source != "파일 수정일"
+        start = v.recorded_at if reliable else None
+        new_trip = not trips
+        if not new_trip and start is not None and prev_end is not None:
+            new_trip = (start - prev_end).total_seconds() > TRIP_GAP_SEC
+        if new_trip:
+            trips.append([i])
+        else:
+            trips[-1].append(i)
+        prev_end = (start + timedelta(seconds=v.duration_sec)) if start is not None else None
+
+    factors: List[Optional[np.ndarray]] = [None] * len(videos)
+    for trip in trips:
+        trip_len = sum(videos[i].duration_sec for i in trip)
+        edge = min(TRIP_EDGE_MAX_SEC, trip_len * 0.15)
+        if edge <= 0:
+            continue
+        offset = 0.0
+        for i in trip:
+            ts = ts_list[i]
+            if ts is not None:
+                g = offset + ts.astype(np.float64)
+                d = np.minimum(g, trip_len - g)
+                factors[i] = (TRIP_EDGE_MIN_FACTOR + (1.0 - TRIP_EDGE_MIN_FACTOR) * np.clip(d / edge, 0.0, 1.0)).astype(np.float32)
+            offset += videos[i].duration_sec
+    return factors
+
+
 def compute_highlight_scores(
     videos: List[VideoFileInfo],
     config: HighlightConfig,
@@ -309,13 +354,18 @@ def compute_highlight_scores(
         if sc > 1e-6:
             scales[key] = sc
 
+    edge_factors = _trip_edge_factors(videos, [c["ts"] if c is not None else None for c in raw])
+
     results: List[Optional[Dict[str, np.ndarray]]] = []
-    for v, comps in zip(videos, raw):
+    for v, comps, edge in zip(videos, raw, edge_factors):
         if comps is None:
             results.append(None)
             continue
         ts = comps["ts"]
         type_w, cut = _type_weights(v, ts, config.straight_weight)
+        blocked = type_w <= 0.0
+        if edge is not None:
+            type_w = type_w * edge  # 출발·도착 부근(주차장일 가능성 높음) 감점
         total_w = 0.0
         score = np.zeros(len(ts), dtype=np.float32)
         out: Dict[str, np.ndarray] = {"ts": ts, "cut": cut}
@@ -335,7 +385,7 @@ def compute_highlight_scores(
                 if f"{key}_n" in out:
                     out[f"{key}_n"] = out[f"{key}_n"] / total_w
         out["score"] = score * type_w
-        out["blocked"] = type_w <= 0.0  # 정차·잘라내기 등 하이라이트로 쓰지 않을 샘플
+        out["blocked"] = blocked  # 정차·잘라내기 등 하이라이트로 쓰지 않을 샘플
         out["fps"] = np.array([float(v.feature_cache["sample_fps"])], dtype=np.float32)  # type: ignore[index]
         results.append(out)
     return results
@@ -343,19 +393,18 @@ def compute_highlight_scores(
 
 # ── 장면 선정 ──
 
-def select_highlights(
-    videos: List[VideoFileInfo],
-    config: HighlightConfig,
-) -> List[HighlightClip]:
-    """
-    점수가 높은 장면부터 골라 목표 길이를 채우고, 시간순으로 정렬된 하이라이트 장면 목록을 반환합니다.
-    분석(feature_cache)이 안 된 영상은 건너뜁니다.
-    """
-    clip_len = max(1.0, float(config.clip_duration_sec))
-    target = max(clip_len, float(config.target_duration_sec))
-    scored = compute_highlight_scores(videos, config)
+GENERIC_REASON = "주행 장면"
+REASON_QUOTA_RATIO = 0.4  # 같은 선정 이유의 장면은 전체의 40%까지만 (커브만 잔뜩 뽑히는 것 방지)
 
-    # 영상별 "창 시작 위치 → 창 평균 점수" 배열
+Window = Tuple[int, int, float]  # (video_idx, start_index, window_mean_score)
+
+
+def _window_table(
+    videos: List[VideoFileInfo],
+    scored: List[Optional[Dict[str, np.ndarray]]],
+    clip_len: float,
+) -> List[Tuple[int, np.ndarray, float, int]]:
+    """영상별 '창 시작 위치 → 창 평균 점수' 배열. 사용할 수 없는 창은 -inf."""
     cands: List[Tuple[int, np.ndarray, float, int]] = []  # (video_idx, window_means, fps, win_steps)
     for vi, (v, sd) in enumerate(zip(videos, scored)):
         if sd is None:
@@ -383,36 +432,71 @@ def select_highlights(
         means[~np.isfinite(means)] = -np.inf
         means[means <= 1e-4] = -np.inf
         cands.append((vi, means, fps, win))
+    return cands
 
-    if not cands:
-        return []
 
-    total_src = sum(v.duration_sec for v in videos)
-    want_count = max(1.0, target / clip_len)
-    # 전체 주행이 고루 담기도록 장면 사이 최소 간격을 둠 (2시간 영상 → 약 2~3분 간격)
-    spread_gap = float(min(180.0, max(clip_len * 0.5, total_src / (want_count * 3.0))))
+def _window_reason(sd: Dict[str, np.ndarray], i1: int, win: int) -> str:
+    """
+    장면 창에서 가장 두드러진 요소를 선정 이유로 붙입니다.
+    가중치가 큰 요소(조향)가 늘 이기지 않도록, 각 요소를 자기 가중치로 나눈 '상대 강도'로 비교합니다.
+    """
+    i2 = max(i1 + 1, min(len(sd["score"]), i1 + win))
+    total, best_key, best_rel = 0.0, "", -1.0
+    for key, wt in COMPONENT_WEIGHTS.items():
+        arr = sd.get(f"{key}_n")
+        if arr is None:
+            continue
+        c = float(np.mean(arr[i1:i2]))
+        total += c
+        rel = c / wt
+        if rel > best_rel:
+            best_key, best_rel = key, rel
+    # 두드러진 요소가 없으면(모든 기여도가 미미) 일반 주행 장면으로 표기
+    return REASON_LABELS.get(best_key, GENERIC_REASON) if total >= 0.05 else GENERIC_REASON
 
-    def window_bounds(vi: int, i: int, fps: float) -> Tuple[float, float]:
-        dur = videos[vi].duration_sec
+
+def _greedy_pick(
+    videos: List[VideoFileInfo],
+    scored: List[Optional[Dict[str, np.ndarray]]],
+    cands: List[Tuple[int, np.ndarray, float, int]],
+    clip_len: float,
+    target_sec: float,
+    spread_gap: float,
+    picked: List[Window],
+) -> List[Window]:
+    """점수 높은 창부터 고르되, 간격·같은 이유 쏠림을 제한합니다. 조건을 단계적으로 풀어 목표 길이를 채웁니다."""
+    picked = list(picked)
+    want_count = max(1.0, target_sec / clip_len)
+    quota = max(2, int(np.ceil(REASON_QUOTA_RATIO * want_count)))
+    ci_of = {vi: ci for ci, (vi, _m, _f, _w) in enumerate(cands)}
+
+    def bounds(vi: int, i: int, fps: float) -> Tuple[float, float]:
         s = i / fps
-        e = min(dur, s + clip_len)
-        return s, e
+        return s, min(videos[vi].duration_sec, s + clip_len)
 
-    picked: List[Tuple[int, int, float]] = []  # (video_idx, start_index, mean_score)
-    total = 0.0
-    for gap in (spread_gap, 0.0):
+    def suppress(arr: np.ndarray, s: float, e: float, fps: float, gap: float) -> None:
+        lo = int(np.floor((s - clip_len - gap) * fps)) + 1
+        hi = int(np.ceil((e + gap) * fps))
+        arr[max(0, lo): max(0, hi)] = -np.inf
+
+    def reason_of(vi: int, i: int) -> str:
+        sd = scored[vi]
+        return _window_reason(sd, i, cands[ci_of[vi]][3]) if sd is not None else GENERIC_REASON
+
+    total = sum(bounds(vi, i, cands[ci_of[vi]][2])[1] - bounds(vi, i, cands[ci_of[vi]][2])[0] for vi, i, _v in picked)
+    for gap, use_quota in ((spread_gap, True), (0.0, True), (0.0, False)):
+        if total >= target_sec - 0.25 * clip_len:
+            break
         work = [m.copy() for (_vi, m, _f, _w) in cands]
-        # 이미 고른 장면 주변 억제
-        for (pvi, pidx, _ps) in picked:
-            for ci, (vi, _m, fps, _w) in enumerate(cands):
-                if vi != pvi:
-                    continue
-                ps, pe = window_bounds(vi, pidx, fps)
-                lo = int(np.floor((ps - clip_len - gap) * fps)) + 1
-                hi = int(np.ceil((pe + gap) * fps))
-                work[ci][max(0, lo): max(0, hi)] = -np.inf
+        counts: Dict[str, int] = {}
+        for pvi, pidx, _pv in picked:
+            ci = ci_of[pvi]
+            ps, pe = bounds(pvi, pidx, cands[ci][2])
+            suppress(work[ci], ps, pe, cands[ci][2], gap)
+            r = reason_of(pvi, pidx)
+            counts[r] = counts.get(r, 0) + 1
 
-        while total < target - 0.25 * clip_len:
+        while total < target_sec - 0.25 * clip_len:
             best_ci, best_i, best_val = -1, -1, -np.inf
             for ci, arr in enumerate(work):
                 if len(arr) == 0:
@@ -423,38 +507,242 @@ def select_highlights(
             if best_ci < 0 or not np.isfinite(best_val):
                 break
             vi, _m, fps, _w = cands[best_ci]
-            s, e = window_bounds(vi, best_i, fps)
+            s, e = bounds(vi, best_i, fps)
+            r = reason_of(vi, best_i)
+            if use_quota and r != GENERIC_REASON and counts.get(r, 0) >= quota:
+                suppress(work[best_ci], s, e, fps, 0.0)  # 이 이유는 이미 충분 → 이 장면은 건너뜀
+                continue
             picked.append((vi, best_i, best_val))
+            counts[r] = counts.get(r, 0) + 1
             total += e - s
-            lo = int(np.floor((s - clip_len - gap) * fps)) + 1
-            hi = int(np.ceil((e + gap) * fps))
-            work[best_ci][max(0, lo): max(0, hi)] = -np.inf
-        if total >= target - 0.25 * clip_len:
-            break
+            suppress(work[best_ci], s, e, fps, gap)
+    return picked
 
+
+def _windows_to_clips(
+    videos: List[VideoFileInfo],
+    scored: List[Optional[Dict[str, np.ndarray]]],
+    cands: List[Tuple[int, np.ndarray, float, int]],
+    picked: List[Window],
+    clip_len: float,
+) -> List[HighlightClip]:
+    ci_of = {vi: ci for ci, (vi, _m, _f, _w) in enumerate(cands)}
     clips: List[HighlightClip] = []
     for vi, idx, val in picked:
-        fps = next(f for (cvi, _m, f, _w) in cands if cvi == vi)
-        s, e = window_bounds(vi, idx, fps)
+        _cvi, _m, fps, win = cands[ci_of[vi]]
+        s = idx / fps
+        e = min(videos[vi].duration_sec, s + clip_len)
         sd = scored[vi]
-        reason = ""
-        if sd is not None:
-            i1 = idx
-            i2 = max(i1 + 1, min(len(sd["score"]), i1 + int(round(clip_len * fps))))
-            best_key, best_c = "", -1.0
-            for key in COMPONENT_WEIGHTS:
-                arr = sd.get(f"{key}_n")
-                if arr is None:
-                    continue
-                c = float(np.mean(arr[i1:i2]))
-                if c > best_c:
-                    best_key, best_c = key, c
-            # 두드러진 요소가 없으면(모든 기여도가 미미) 일반 주행 장면으로 표기
-            reason = REASON_LABELS.get(best_key, "") if best_c >= 0.03 else "주행 장면"
+        reason = _window_reason(sd, idx, win) if sd is not None else ""
         clips.append(HighlightClip(videos[vi], s, e, score=val, reason=reason))
-
     order = {id(v): i for i, v in enumerate(videos)}
     clips.sort(key=lambda c: (order[id(c.video)], c.start_sec))
+    return clips
+
+
+def select_highlights(
+    videos: List[VideoFileInfo],
+    config: HighlightConfig,
+) -> List[HighlightClip]:
+    """
+    점수가 높은 장면부터 골라 목표 길이를 채우고, 시간순으로 정렬된 하이라이트 장면 목록을 반환합니다.
+    분석(feature_cache)이 안 된 영상은 건너뜁니다.
+    """
+    clip_len = max(1.0, float(config.clip_duration_sec))
+    target = max(clip_len, float(config.target_duration_sec))
+    scored = compute_highlight_scores(videos, config)
+    cands = _window_table(videos, scored, clip_len)
+    if not cands:
+        return []
+    total_src = sum(v.duration_sec for v in videos)
+    want_count = max(1.0, target / clip_len)
+    # 전체 주행이 고루 담기도록 장면 사이 최소 간격을 둠 (2시간 영상 → 약 2~3분 간격)
+    spread_gap = float(min(180.0, max(clip_len * 0.5, total_src / (want_count * 3.0))))
+    if all(v.feature_cache is None or "appear" in v.feature_cache for v in videos):
+        # 장면 모습 썸네일이 있으면: 컷끼리 배경이 겹치지 않게 고르는 방식 사용
+        diverse = select_diverse_highlights(videos, config, int(round(want_count)))
+        if diverse:
+            return diverse
+    picked = _greedy_pick(videos, scored, cands, clip_len, target, spread_gap, [])
+    return _windows_to_clips(videos, scored, cands, picked, clip_len)
+
+
+# ── 장면 모습(appearance) 분석: 컷끼리 배경이 겹치지 않게 고르기 위한 썸네일 ──
+
+APPEAR_CACHE_VERSION = "appear_v2"
+APPEAR_STEP_SEC = 2.0
+APPEAR_W, APPEAR_H = 32, 18
+DARK_BRIGHTNESS = 45.0     # 평균 밝기가 이보다 낮으면(지하주차장·심야 골목 등) 감점
+MIN_CUT_GAP_SEC = 20.0     # 고른 컷끼리 최소 시간 간격 (바로 옆 장면이 연달아 뽑히지 않게)
+POOL_BLOCK_SEC = 8.0       # 후보 풀: 8초 구간마다 가장 나은 창 하나씩
+DUPLICATE_DISTANCE = 0.08  # 이미 고른 컷과 모습 차이가 이보다 작으면 같은 장면으로 보고 제외
+
+
+def _appear_cache_path(video_path: Path) -> Optional[Path]:
+    try:
+        st = video_path.stat()
+        key = f"{APPEAR_CACHE_VERSION}|{video_path.resolve()}|{st.st_size}|{int(st.st_mtime)}|{APPEAR_STEP_SEC}"
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+        cache_dir = Path(tempfile.gettempdir()) / "quick_dash_cam_fcache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"appear_{digest}.npy"
+    except Exception:
+        return None
+
+
+def save_appearance_cache(video_path: Path, thumbs: np.ndarray) -> None:
+    """구간 분석(analyzer)이 디코딩하면서 모은 썸네일을 저장합니다 (추가 디코딩 없이 재사용)."""
+    cache = _appear_cache_path(video_path)
+    if cache is not None and len(thumbs):
+        try:
+            np.save(cache, thumbs.astype(np.uint8))
+        except Exception:
+            pass
+
+
+def extract_appearance_thumbs(
+    video_path: Path,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    use_gpu_accel: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    APPEAR_STEP_SEC(2초)마다 32x18 썸네일. 보통은 구간 분석 때 함께 저장된 캐시를 읽고,
+    캐시가 없을 때만(이번 기능 이전에 분석한 영상) 분석과 같은 GPU 디코딩 경로로 한 번 뽑습니다.
+    반환: (n, 18, 32, 3) uint8 BGR — i번째 썸네일은 i*2초 지점.
+    """
+    import cv2
+    from .analyzer import _iter_downsampled_frames  # 순환 import 방지를 위해 지연 import
+
+    cache = _appear_cache_path(video_path)
+    if cache is not None and cache.exists():
+        try:
+            return np.load(cache)
+        except Exception:
+            pass
+    thumbs: List[np.ndarray] = []
+    for _t, frame in _iter_downsampled_frames(video_path, 1.0 / APPEAR_STEP_SEC, use_gpu_accel, cancel_check):
+        if cancel_check and cancel_check():
+            return None
+        thumbs.append(cv2.resize(frame, (APPEAR_W, APPEAR_H), interpolation=cv2.INTER_AREA))
+    if not thumbs:
+        return None
+    arr = np.stack(thumbs).astype(np.uint8)
+    save_appearance_cache(video_path, arr)
+    return arr
+
+
+def ensure_appearance(
+    video: VideoFileInfo,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Optional[np.ndarray]:
+    fc = video.feature_cache
+    if not fc:
+        return None
+    if "appear" in fc:
+        return fc["appear"]
+    thumbs = extract_appearance_thumbs(video.path, cancel_check)
+    if thumbs is not None:
+        fc["appear"] = thumbs
+    return thumbs
+
+
+def _appearance_descriptor(thumb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    """(색 분포 히스토그램, 화면 구도 격자, 평균 밝기). 하늘·도로·건물·나무의 색과 배치가 다르면 다른 장면."""
+    import cv2  # 지연 import (분석 모듈과 동일 의존성)
+
+    hsv = cv2.cvtColor(thumb, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, [12, 3, 3], [0, 180, 0, 256, 0, 256]).ravel()
+    hist = np.sqrt(hist / max(1.0, float(hist.sum())))  # Hellinger 거리용
+    small = cv2.resize(thumb, (8, 4), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    layout = small.ravel()
+    brightness = float(hsv[..., 2].mean())
+    return hist.astype(np.float32), layout.astype(np.float32), brightness
+
+
+def _appearance_distance(a: Tuple[np.ndarray, np.ndarray, float], b: Tuple[np.ndarray, np.ndarray, float]) -> float:
+    """0(같은 장면) ~ 약 1(완전히 다른 장면)."""
+    hell = float(np.linalg.norm(a[0] - b[0]) / np.sqrt(2.0))
+    lay = float(np.sqrt(np.mean((a[1] - b[1]) ** 2)) * 2.0)
+    return 0.6 * hell + 0.4 * min(1.0, lay)
+
+
+def select_diverse_highlights(
+    videos: List[VideoFileInfo],
+    config: HighlightConfig,
+    count: int,
+) -> Optional[List[HighlightClip]]:
+    """
+    컷끼리 서로 달라 보이도록 고릅니다 (장면 안의 움직임보다 '배경이 겹치지 않는 것'이 중요).
+    - 정차·잘라내기·출발/도착 부근은 기존 점수에서 이미 제외/감점, 어두운 장면은 추가 감점
+    - 첫 컷은 가장 나은 장면, 이후로는 '이미 고른 컷들과의 최소 차이 × 장면 품질'이 가장 큰 장면을 선택
+    장면 모습 썸네일(ensure_appearance)이 없는 영상이 있으면 None (호출 측에서 기존 방식으로 대체).
+    """
+    if count <= 0:
+        return []
+    if any(v.feature_cache is not None and "appear" not in v.feature_cache for v in videos):
+        return None
+    clip_len = max(1.0, float(config.clip_duration_sec))
+    scored = compute_highlight_scores(videos, config)
+    cands = _window_table(videos, scored, clip_len)
+    if not cands:
+        return []
+
+    offsets: List[float] = []
+    cursor = 0.0
+    for v in videos:
+        offsets.append(cursor)
+        cursor += v.duration_sec
+
+    # 후보 풀: 8초 구간마다 가장 나은 창 하나
+    pool: List[Tuple[int, int, float, float, Tuple[np.ndarray, np.ndarray, float]]] = []
+    for vi, means, fps, win in cands:
+        thumbs = videos[vi].feature_cache["appear"]  # type: ignore[index]
+        block = max(1, int(round(POOL_BLOCK_SEC * fps)))
+        for b0 in range(0, len(means), block):
+            seg = means[b0: b0 + block]
+            j = int(np.argmax(seg))
+            if not np.isfinite(seg[j]):
+                continue
+            idx = b0 + j
+            mid_t = idx / fps + clip_len / 2.0
+            ti = int(min(len(thumbs) - 1, max(0, round(mid_t / APPEAR_STEP_SEC))))
+            pool.append((vi, idx, float(seg[j]), offsets[vi] + mid_t, _appearance_descriptor(thumbs[ti])))
+    if not pool:
+        return []
+
+    # 장면 품질: 점수 순위(0~1)를 쓰되 비중을 낮춰 '다른 모습'이 우선되게, 어두우면 감점
+    vals = np.array([p[2] for p in pool])
+    ranks = vals.argsort().argsort() / max(1, len(vals) - 1)
+    quality = 0.5 + 0.5 * ranks
+    for k, p in enumerate(pool):
+        if p[4][2] < DARK_BRIGHTNESS:
+            quality[k] *= 0.35
+
+    chosen: List[int] = []
+    min_gap = min(MIN_CUT_GAP_SEC, cursor / max(1, count) * 0.5)
+    alive = np.ones(len(pool), dtype=bool)
+    min_dist = np.full(len(pool), np.inf)
+    while len(chosen) < count and alive.any():
+        if not chosen:
+            obj = np.where(alive, quality, -np.inf)
+        else:
+            usable = alive & (min_dist >= DUPLICATE_DISTANCE)  # 거의 같은 모습의 컷은 개수가 모자라도 넣지 않음
+            obj = np.where(usable, np.minimum(min_dist, 1.0) * quality, -np.inf)
+        k = int(np.argmax(obj))
+        if not np.isfinite(obj[k]):
+            break
+        chosen.append(k)
+        alive[k] = False
+        for m in range(len(pool)):
+            if not alive[m]:
+                continue
+            if abs(pool[m][3] - pool[k][3]) < max(clip_len, min_gap):
+                alive[m] = False  # 너무 가까운 시간대
+                continue
+            min_dist[m] = min(min_dist[m], _appearance_distance(pool[m][4], pool[k][4]))
+
+    picked: List[Window] = [(pool[k][0], pool[k][1], pool[k][2]) for k in chosen]
+    clips = _windows_to_clips(videos, scored, cands, picked, clip_len)
     return clips
 
 

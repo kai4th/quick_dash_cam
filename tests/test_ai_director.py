@@ -91,8 +91,12 @@ args = sys.argv[1:]
 log = Path(os.environ["FAKE_CLAUDE_LOG"])
 calls = json.loads(log.read_text()) if log.exists() else []
 prompt = sys.stdin.read()
-calls.append({{"args": args, "cwd": os.getcwd(), "files": sorted(os.listdir(".")), "prompt": prompt}})
+calls.append({{"args": args, "cwd": os.getcwd(), "files": sorted(os.listdir(".")), "prompt": prompt,
+              "has_api_key": "ANTHROPIC_API_KEY" in os.environ}})
 log.write_text(json.dumps(calls, ensure_ascii=False))
+if os.environ.get("FAKE_CLAUDE_AUTH_FAIL"):
+    print(json.dumps({{"type": "result", "subtype": "success", "is_error": True,
+                      "result": "Invalid API key · Please run /login"}})); sys.exit(1)
 if os.environ.get("FAKE_CLAUDE_OLD") and "--json-schema" in args:
     sys.stderr.write("error: unknown option '--json-schema'\n"); sys.exit(1)
 import re
@@ -125,6 +129,8 @@ def test_claude_code_backend(videos: list, tmp: Path) -> None:
     old_path = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{bin_dir}{os.pathsep}{old_path}"
     os.environ["FAKE_CLAUDE_LOG"] = str(log)
+    saved_key = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "sk-stale-key"  # 구독 모드에서는 Claude Code에 전달되면 안 됨
     try:
         hcfg = HighlightConfig(target_duration_sec=4.0, clip_duration_sec=2.0)
         clips, title = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
@@ -136,6 +142,7 @@ def test_claude_code_backend(videos: list, tmp: Path) -> None:
         assert json.loads(args[args.index("--json-schema") + 1]) == RESULT_SCHEMA
         assert any(f.endswith(".jpg") for f in calls[0]["files"]), "contact sheets must be in the CLI working dir"
         assert "candidates_01.jpg" in calls[0]["prompt"], "prompt must reference sheet file names"
+        assert not calls[0]["has_api_key"], "ANTHROPIC_API_KEY must be stripped in subscription mode"
         used = [c for c in clips if c.included]
         assert title == "아침 출근길" and len(used) == 2, (title, len(used))
         assert all(c.caption.startswith("자막") for c in clips)
@@ -149,9 +156,25 @@ def test_claude_code_backend(videos: list, tmp: Path) -> None:
         assert len(calls) == 2 and "--json-schema" not in calls[1]["args"]
         assert sum(c.included for c in clips2) == 2
         print("[PASS] Claude Code backend retries without unsupported options (older CLI)")
+
+        # 로그인 오류: 실제 메시지·사용한 경로·해결 방법을 보여줘야 함
+        os.environ.pop("FAKE_CLAUDE_OLD", None)
+        os.environ["FAKE_CLAUDE_AUTH_FAIL"] = "1"
+        try:
+            ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
+            raise AssertionError("expected AiDirectorError")
+        except AiDirectorError as exc:
+            msg = str(exc)
+            assert "Invalid API key" in msg and str(fake) in msg and "/login" in msg and "해결 방법" in msg, msg
+        print("[PASS] Claude Code login error shows real message, claude path and fix steps")
     finally:
         os.environ["PATH"] = old_path
         os.environ.pop("FAKE_CLAUDE_OLD", None)
+        os.environ.pop("FAKE_CLAUDE_AUTH_FAIL", None)
+        if saved_key is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
 
 
 def test_claude_api_backend(videos: list, tmp: Path) -> None:

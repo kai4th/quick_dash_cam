@@ -19,7 +19,7 @@ import numpy as np
 
 from .ai_director import AiDirectorError, ai_select_highlights, find_claude_cli
 from .analyzer import analyze_video, reclassify_from_cache
-from .highlights import ensure_audio_levels, render_highlight_shorts, select_highlights
+from .highlights import ensure_appearance, ensure_audio_levels, render_highlight_shorts, select_highlights
 from .ffmpeg_utils import (
     VIDEO_EXTENSIONS,
     detect_best_gpu_decoder,
@@ -2947,7 +2947,7 @@ class QuickDashCamApp(ctk.CTk):
             )
             return
         hcfg = self._get_highlight_config()
-        ready = all(v.feature_cache is not None for v in self.videos)
+        ready = all(v.feature_cache is not None and "appear" in v.feature_cache for v in self.videos)
         if hcfg.use_audio_peaks:
             ready = ready and all(
                 (not v.has_audio) or ("audio_db" in (v.feature_cache or {})) for v in self.videos
@@ -3177,6 +3177,9 @@ class QuickDashCamApp(ctk.CTk):
                 report((idx + 0.9) / total_v * prep_share,
                        f"[하이라이트] 소리 이벤트(경적 등) 분석 {idx + 1}/{total_v}: {v.filename}")
                 ensure_audio_levels(v, cancel_check=lambda: self.cancel_requested)
+            report((idx + 0.95) / total_v * prep_share,
+                   f"[하이라이트] 장면 모습 분석(컷끼리 겹치지 않게) {idx + 1}/{total_v}: {v.filename}")
+            ensure_appearance(v, cancel_check=lambda: self.cancel_requested)
         if self.cancel_requested:
             raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
 

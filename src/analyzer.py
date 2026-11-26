@@ -488,6 +488,9 @@ def analyze_video(
     prev_steer_f32: Optional[np.ndarray] = None
     prev_sc_sobel: Optional[np.ndarray] = None
     coarse_history: List[np.ndarray] = []
+    # 하이라이트 쇼츠용 장면 모습 썸네일 (2초마다, 같은 디코딩을 재사용하므로 추가 비용 없음)
+    from .highlights import APPEAR_H, APPEAR_STEP_SEC, APPEAR_W, save_appearance_cache
+    appear_thumbs: List[np.ndarray] = []
 
     lookback_steps = max(1, int(round(0.5 * sample_fps)))  # 0.5초 전 프레임과 전방/도로변 구도 비교
 
@@ -498,6 +501,8 @@ def analyze_video(
             return []
 
         timestamps.append(t_sec)
+        if t_sec + 1e-6 >= len(appear_thumbs) * APPEAR_STEP_SEC:
+            appear_thumbs.append(cv2.resize(frame, (APPEAR_W, APPEAR_H), interpolation=cv2.INTER_AREA))
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
@@ -574,6 +579,10 @@ def analyze_video(
         "scene": scene_arr,
         "sample_fps": sample_fps,
     }
+    if appear_thumbs:
+        thumbs_arr = np.stack(appear_thumbs).astype(np.uint8)
+        video_info.feature_cache["appear"] = thumbs_arr
+        save_appearance_cache(video_info.path, thumbs_arr)
 
     if disk_cache is not None:
         try:

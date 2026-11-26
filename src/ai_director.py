@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 
 from .ffmpeg_utils import get_CreationFlags, get_ffmpeg_exe
-from .highlights import clip_timestamp_text, select_highlights
+from .highlights import clip_timestamp_text, ensure_appearance, select_diverse_highlights, select_highlights
 from .models import AiDirectorMode, HighlightClip, HighlightConfig, VideoFileInfo
 
 API_MODEL = "claude-opus-5-5"
@@ -88,8 +88,12 @@ def candidate_count_for(hcfg: HighlightConfig) -> Tuple[int, int]:
 
 
 def select_candidates(videos: List[VideoFileInfo], hcfg: HighlightConfig) -> List[HighlightClip]:
-    """알고리즘으로 AI에게 보여줄 후보 장면을 넉넉히 고릅니다 (시간순)."""
+    """AI에게 보여줄 후보 장면을 넉넉히 고릅니다 (서로 다른 모습 위주, 시간순)."""
     _n_final, n_cand = candidate_count_for(hcfg)
+    # 점수 순으로만 뽑으면 커브·주차장 같은 '화면 변화 큰' 장면에 쏠리므로, 서로 다른 모습의 장면을 넉넉히 뽑아 Claude가 판단하게 함
+    diverse = select_diverse_highlights(videos, hcfg, n_cand)
+    if diverse:
+        return diverse
     cand_cfg = HighlightConfig(
         target_duration_sec=n_cand * hcfg.clip_duration_sec,
         clip_duration_sec=hcfg.clip_duration_sec,
@@ -220,10 +224,14 @@ def build_prompt(
 - 역동적인 장면: 회전, 고갯길·커브, 터널 진입·진출, 다리 위, 고가도로
 - 이야깃거리가 있는 장면: 끼어들기·돌발 상황, 특이한 차량·풍경, 눈에 띄는 표지판·랜드마크
 
+## 가장 중요한 기준: 컷끼리 배경이 겹치지 않을 것
+- 한 장면은 약 {candidates[0].duration:.0f}초짜리 컷이라, 그 안에서 화면이 많이 변할 필요는 없어. 차분한 풍경 컷도 좋아.
+- 대신 고른 컷들끼리는 배경·장소·분위기가 서로 달라야 해 (예: 시내 → 강변 → 터널 → 산길 → 노을).
+- 같은 도로·비슷한 풍경이 반복되면 그중 가장 나은 하나만 골라.
+
 ## 피할 장면
 - 정체로 거의 멈춰 있거나 화면 변화가 없는 장면, 주차장·지하주차장
 - 너무 어둡거나 흐리거나 역광·유리 반사가 심해 알아보기 힘든 장면
-- 다른 후보와 거의 같은 장면 (비슷하면 더 나은 하나만)
 - 선택한 장면들이 한 시간대에 몰리지 않고 주행 전체에 고루 퍼지면 더 좋아
 
 ## 응답 (JSON만 출력)
@@ -342,10 +350,10 @@ def find_claude_cli() -> Optional[str]:
 
 
 def _run_process(cmd: List[str], stdin_text: str, cwd: Path, timeout: float,
-                 cancel_check: Optional[CancelFn]) -> Tuple[int, str, str]:
+                 cancel_check: Optional[CancelFn], env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
     proc = subprocess.Popen(
         cmd, cwd=str(cwd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        creationflags=get_CreationFlags(),
+        creationflags=get_CreationFlags(), env=env,
     )
     t0 = time.time()
     payload: Optional[bytes] = stdin_text.encode("utf-8")
@@ -364,7 +372,39 @@ def _run_process(cmd: List[str], stdin_text: str, cwd: Path, timeout: float,
             continue
 
 
-def parse_cli_output(stdout: str) -> Dict:
+CLI_STRIPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+def _cli_error_text(stdout: str, stderr: str) -> str:
+    """실패한 실행의 출력에서 사람이 읽을 오류 문구를 꺼냅니다 (JSON 출력이면 result 필드)."""
+    for text in (stdout, stderr):
+        obj = _extract_json_object(text) if text.strip() else None
+        if isinstance(obj, dict) and obj.get("result"):
+            return str(obj["result"]).strip()
+    return (stderr.strip() or stdout.strip() or "(오류 메시지 없음)")
+
+
+def _looks_like_auth_error(low: str) -> bool:
+    return any(k in low for k in ("/login", "not logged in", "invalid api key", "authentication", "oauth", "unauthorized", "401"))
+
+
+def _explain_cli_failure(exe: str, err: str) -> str:
+    low = err.lower()
+    msg = f"Claude Code 실행에 실패했습니다.\n\n[사용한 claude 경로]\n{exe}\n\n[Claude Code가 보낸 메시지]\n{err[:1200]}"
+    if _looks_like_auth_error(low):
+        msg += (
+            "\n\n[해결 방법]\n"
+            "1) PowerShell(또는 터미널)을 열고 `claude`를 실행합니다.\n"
+            "2) 로그인 화면이 나오면 Claude 구독 계정으로 로그인합니다 (이미 실행 중이면 `/login` 입력).\n"
+            "3) `claude -p \"안녕\"`을 실행해 답이 나오면 앱에서 다시 시도하세요.\n"
+            "※ Claude 데스크톱 앱·웹 로그인과 터미널용 claude 로그인은 별개입니다."
+        )
+    elif "credit" in low or "usage limit" in low or "rate limit" in low:
+        msg += "\n\n구독 사용량 한도에 걸렸을 수 있습니다. 잠시 후 다시 시도하거나 [Claude API] 방식을 사용해 주세요."
+    return msg
+
+
+def parse_cli_output(stdout: str, exe: str = "claude") -> Dict:
     """`claude -p --output-format json` 출력에서 결과 JSON을 꺼냅니다."""
     try:
         outer = json.loads(stdout.strip())
@@ -373,7 +413,7 @@ def parse_cli_output(stdout: str) -> Dict:
     if not isinstance(outer, dict):
         raise AiDirectorError(f"Claude Code 출력 형식을 이해하지 못했습니다:\n{stdout[:500]}")
     if outer.get("is_error") or outer.get("subtype", "success") != "success":
-        raise AiDirectorError(f"Claude Code 실행 중 오류가 발생했습니다:\n{str(outer.get('result', ''))[:500]}")
+        raise AiDirectorError(_explain_cli_failure(exe, str(outer.get("result", "")) or "(오류 메시지 없음)"))
     structured = outer.get("structured_output")
     if isinstance(structured, dict):
         return structured
@@ -402,30 +442,36 @@ def run_claude_code(
         "\n\n위 이미지 파일들은 현재 폴더에 있어. Read 도구로 모든 이미지를 확인한 뒤, "
         "설명 없이 JSON 객체 하나만 출력해."
     )
-    base = [exe, "-p", "--output-format", "json", "--model", CLI_MODEL]
+    # "구독 계정" 모드: API 키 환경 변수가 있으면 Claude Code가 구독 로그인 대신 그 키를 쓰므로 빼고 실행
+    env = {k: v for k, v in os.environ.items() if k not in CLI_STRIPPED_ENV}
+
     # .cmd/.bat(npm 설치본)은 cmd.exe를 거치며 따옴표가 깨질 수 있어 JSON 스키마 인자는 생략 (프롬프트로 형식 지정)
     is_batch = exe.lower().endswith((".cmd", ".bat"))
-    attempts: List[List[str]] = []
     newer = ["--tools", "Read", "--allowedTools", "Read", "--no-session-persistence"]
+    variants: List[List[str]] = []
     if not is_batch:
-        attempts.append(base + newer + ["--json-schema", json.dumps(RESULT_SCHEMA, ensure_ascii=False)])
-    attempts.append(base + newer)
-    attempts.append(base + ["--allowedTools", "Read"])  # 구버전 Claude Code 호환
+        variants.append(newer + ["--json-schema", json.dumps(RESULT_SCHEMA, ensure_ascii=False)])
+    variants.append(newer)
+    variants.append(["--allowedTools", "Read"])  # 구버전 Claude Code 호환
 
+    use_model = True
     last_err = ""
-    for cmd in attempts:
-        code, out, err = _run_process(cmd, full, workdir, timeout, cancel_check)
+    i = 0
+    while i < len(variants):
+        cmd = [exe, "-p", "--output-format", "json"] + (["--model", CLI_MODEL] if use_model else []) + variants[i]
+        code, out, err = _run_process(cmd, full, workdir, timeout, cancel_check, env)
         if code == 0 and out.strip():
-            return parse_cli_output(out)
-        last_err = (err or out).strip()
-        if "unknown option" in last_err.lower() or "unexpected argument" in last_err.lower():
-            continue  # 이 버전에 없는 옵션 → 더 단순한 명령으로 재시도
+            return parse_cli_output(out, exe)
+        last_err = _cli_error_text(out, err)
+        low = last_err.lower()
+        if "unknown option" in low or "unexpected argument" in low:
+            i += 1  # 이 버전에 없는 옵션 → 더 단순한 명령으로 재시도
+            continue
+        if use_model and "model" in low and not _looks_like_auth_error(low):
+            use_model = False  # 요금제에서 Opus를 못 쓰는 경우 등 → 계정 기본 모델로 재시도
+            continue
         break
-    hint = ""
-    low = last_err.lower()
-    if "login" in low or "auth" in low or "credit" in low:
-        hint = "\n\n터미널에서 `claude`를 실행해 로그인 상태를 확인해 주세요."
-    raise AiDirectorError(f"Claude Code 실행에 실패했습니다:\n{last_err[:600]}{hint}")
+    raise AiDirectorError(_explain_cli_failure(exe, last_err))
 
 
 # ── 4-B. Claude API (API 키) ──
@@ -512,6 +558,10 @@ def ai_select_highlights(
     runner는 테스트용(실제 Claude 대신 호출)입니다.
     """
     n_final, _n_cand = candidate_count_for(hcfg)
+    for v in videos:  # 서로 다른 모습의 후보를 고르기 위한 썸네일 (캐시되어 있으면 즉시)
+        if cancel_check and cancel_check():
+            raise AiDirectorError("사용자에 의해 작업이 취소되었습니다.")
+        ensure_appearance(v, cancel_check)
     candidates = select_candidates(videos, hcfg)
     if not candidates:
         return [], ""
