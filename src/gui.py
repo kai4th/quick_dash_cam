@@ -3178,10 +3178,10 @@ class QuickDashCamApp(ctk.CTk):
     def _compute_highlights_in_worker(
         self, acfg: AnalysisConfig, hcfg: HighlightConfig, prog_scale: float,
         ai_mode: AiDirectorMode = AiDirectorMode.OFF, api_key: Optional[str] = None,
-    ) -> Tuple[List[HighlightClip], str, Optional[str]]:
+    ) -> Tuple[List[HighlightClip], Optional[str]]:
         """
         (작업 스레드) 미분석 영상 분석 → 오디오 음량 추출 → 하이라이트 선정(알고리즘 또는 Claude).
-        반환: (하이라이트 목록, AI 제안 제목, AI 실패 메시지). AI가 실패하면 알고리즘 결과로 대신합니다.
+        반환: (하이라이트 목록, AI 실패 메시지). AI가 실패하면 알고리즘 결과로 대신합니다.
         """
         videos = list(self.videos)
         total_v = max(1, len(videos))
@@ -3221,12 +3221,12 @@ class QuickDashCamApp(ctk.CTk):
 
         if use_ai:
             try:
-                clips, title = ai_select_highlights(
+                clips = ai_select_highlights(
                     videos, hcfg, ai_mode, api_key=api_key,
                     progress=lambda f, m: report(prep_share + (1.0 - prep_share) * f, m),
                     cancel_check=lambda: self.cancel_requested,
                 )
-                return clips, title, None
+                return clips, None
             except AiDirectorError as exc:
                 if self.cancel_requested:
                     raise RuntimeError("사용자에 의해 작업이 취소되었습니다.") from exc
@@ -3236,19 +3236,17 @@ class QuickDashCamApp(ctk.CTk):
                     raise RuntimeError("사용자에 의해 작업이 취소되었습니다.") from exc
                 ai_error = f"{type(exc).__name__}: {exc}"
             report(1.0, "[하이라이트] AI 선정 실패 — 알고리즘으로 장면을 고르는 중...")
-            return select_highlights(videos, hcfg), "", ai_error
+            return select_highlights(videos, hcfg), ai_error
 
         report(1.0, "[하이라이트] 볼 만한 장면을 고르는 중...")
-        return select_highlights(videos, hcfg), "", None
+        return select_highlights(videos, hcfg), None
 
-    def _apply_highlight_result(self, clips: List[HighlightClip], title: str, ai_error: Optional[str]) -> str:
+    def _apply_highlight_result(self, clips: List[HighlightClip], ai_error: Optional[str]) -> str:
         """(메인 스레드) 선정 결과를 화면에 반영하고 상태 메시지를 돌려줍니다."""
         self.highlight_clips = clips
         self.highlight_index = None
         if clips:
             self._shorts_toggle_options(show=False)  # 결과 목록이 잘 보이도록 옵션 영역 자동 접기
-        if title and not self.shorts_title_entry.get().strip():
-            self.shorts_title_entry.insert(0, title)
         self._refresh_shorts_ui()
         used = [c for c in clips if c.included]
         total = sum(c.duration for c in used)
@@ -3262,7 +3260,6 @@ class QuickDashCamApp(ctk.CTk):
         if any(c.ai_score is not None for c in clips):
             return (
                 f"🤖 Claude가 후보 {len(clips)}개 중 {len(used)}개 선정 (약 {total:.0f}초)"
-                + (f" · 제목 제안: {title}" if title else "")
                 + " — 제외된 후보도 더블클릭으로 바꿔 넣을 수 있습니다."
             )
         return f"✨ 하이라이트 {len(used)}개 선정 (약 {total:.0f}초) — 목록에서 장면을 확인하고 [🎬 쇼츠 만들기]를 누르세요."
@@ -3286,11 +3283,11 @@ class QuickDashCamApp(ctk.CTk):
 
         def worker():
             try:
-                clips, title, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 1.0, ai_mode, api_key)
+                clips, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 1.0, ai_mode, api_key)
 
                 def done():
                     self.progress_bar.set(1.0)
-                    msg = self._apply_highlight_result(clips, title, ai_error)
+                    msg = self._apply_highlight_result(clips, ai_error)
                     self._set_busy_state(False, msg)
 
                 self.after(0, done)
@@ -3352,11 +3349,9 @@ class QuickDashCamApp(ctk.CTk):
         def worker():
             try:
                 if need_search:
-                    clips, title, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 0.3, ai_mode, api_key)
-                    if title and not shorts_cfg.title_text:
-                        shorts_cfg.title_text = title
+                    clips, ai_error = self._compute_highlights_in_worker(acfg, hcfg, 0.3, ai_mode, api_key)
                     self.highlight_clips = clips
-                    self.after(0, lambda: self._apply_highlight_result(clips, title, ai_error))
+                    self.after(0, lambda: self._apply_highlight_result(clips, ai_error))
                 base = 0.3 if need_search else 0.0
                 # 하이라이트를 고른 뒤 사용자가 잘라낸(삭제한) 영상 부분은 쇼츠에도 넣지 않음
                 use = [

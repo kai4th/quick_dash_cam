@@ -5,7 +5,7 @@ Claude가 하이라이트 장면을 골라 주는 "AI 편집자".
 1) 알고리즘으로 목표 장면 수의 약 5배 후보를 서로 다른 모습 위주로 넉넉히 뽑습니다.
 2) 후보마다 시작·중간·끝 3프레임을 가로로 이어 붙이고, 후보 6개씩 한 장의 "콘택트 시트" 이미지로 묶습니다.
    (이미지 장수를 줄여 Claude Code가 파일을 읽는 횟수와 API 토큰 비용을 모두 줄임)
-3) Claude에게 후보별 점수·장면 설명·자막과, 최종으로 쓸 장면 번호·쇼츠 제목을 JSON으로 받습니다.
+3) Claude에게 후보별 점수·장면 설명·자막과, 최종으로 쓸 장면 번호를 JSON으로 받습니다.
    - Claude Code CLI(`claude -p`, 구독 계정) 또는 Claude API(anthropic SDK, API 키) 중 선택
 4) 응답을 검증해 HighlightClip 목록에 반영합니다. 선택되지 않은 후보도 목록에 남겨(제외 상태)
    사용자가 직접 바꿔 넣을 수 있게 합니다.
@@ -45,7 +45,6 @@ CancelFn = Callable[[], bool]
 RESULT_SCHEMA: Dict = {
     "type": "object",
     "properties": {
-        "title": {"type": "string"},
         "candidates": {
             "type": "array",
             "items": {
@@ -62,7 +61,7 @@ RESULT_SCHEMA: Dict = {
         },
         "selected_ids": {"type": "array", "items": {"type": "integer"}},
     },
-    "required": ["title", "candidates", "selected_ids"],
+    "required": ["candidates", "selected_ids"],
     "additionalProperties": False,
 }
 
@@ -250,7 +249,6 @@ def build_prompt(
     - 과장·감탄·유행어 금지. 붙일 만한 말이 없으면 빈 문자열("")로 둬 (억지 자막보다 없는 게 나음)
     - 고른 장면들끼리 같은 표현을 반복하지 말 것
 - selected_ids: 쇼츠에 넣을 후보 번호 정확히 {n_final}개
-- title: 쇼츠 제목 한국어 20자 이내, 이모지 금지
 """
 
 
@@ -282,11 +280,11 @@ def apply_ai_result(
     data: Dict,
     candidates: Sequence[HighlightClip],
     n_final: int,
-) -> Tuple[List[HighlightClip], str]:
+) -> List[HighlightClip]:
     """
     Claude 응답을 검증해 후보 목록에 반영합니다.
     - 모르는 번호·중복은 무시, 선택이 모자라면 AI 점수 → 알고리즘 점수 순으로 채우고, 넘치면 AI 점수 높은 순으로 자름
-    - 반환: (후보 전체 목록 — 선택된 것만 included=True, 쇼츠 제목)
+    - 반환: 후보 전체 목록 — 선택된 것만 included=True
     """
     n = len(candidates)
     n_final = min(max(1, n_final), n)
@@ -338,7 +336,7 @@ def apply_ai_result(
             ai_score=ai_score(cid) if cid in info else None,
             caption=_clean_text(item.get("caption"), 12).rstrip("!~.,"),
         ))
-    return result, _clean_text(data.get("title"), 30)
+    return result
 
 
 # ── 4-A. Claude Code CLI (구독 계정) ──
@@ -565,10 +563,10 @@ def ai_select_highlights(
     progress: Optional[ProgressFn] = None,
     cancel_check: Optional[CancelFn] = None,
     runner: Optional[Callable[[str, Path, List[ContactSheet]], Dict]] = None,
-) -> Tuple[List[HighlightClip], str]:
+) -> List[HighlightClip]:
     """
     후보 선정 → 콘택트 시트 → Claude 평가 → 결과 반영.
-    반환: (후보 전체 HighlightClip 목록 — Claude가 고른 장면만 included=True, 제안 제목)
+    반환: 후보 전체 HighlightClip 목록 — Claude가 고른 장면만 included=True
     runner는 테스트용(실제 Claude 대신 호출)입니다.
     """
     n_final, _n_cand = candidate_count_for(hcfg)
@@ -578,7 +576,7 @@ def ai_select_highlights(
         ensure_appearance(v, cancel_check)
     candidates = select_candidates(videos, hcfg)
     if not candidates:
-        return [], ""
+        return []
 
     def sub(lo: float, hi: float) -> Optional[ProgressFn]:
         if progress is None:

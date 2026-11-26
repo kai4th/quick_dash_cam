@@ -48,7 +48,6 @@ def _fake_candidates(n: int) -> list:
 def test_apply_ai_result() -> None:
     cands = _fake_candidates(8)
     data = {
-        "title": "노을 드라이브 🌅",
         "candidates": [
             {"id": 3, "score": 9, "reason": "노을 진 해안도로", "caption": "바다가 보인다 😍"},
             {"id": 5, "score": 12, "reason": "터널 진출", "caption": "터널 탈출"},
@@ -57,8 +56,7 @@ def test_apply_ai_result() -> None:
         ],
         "selected_ids": [5, 3, 3, 99, "x"],
     }
-    clips, title = apply_ai_result(data, cands, n_final=3)
-    assert title == "노을 드라이브", title
+    clips = apply_ai_result(data, cands, n_final=3)
     assert len(clips) == 8
     chosen = [i + 1 for i, c in enumerate(clips) if c.included]
     # 5, 3 선택 + 부족한 1개는 AI 점수 높은 2번으로 채움, 모르는 번호·중복은 무시
@@ -78,7 +76,7 @@ def test_candidate_counts() -> None:
 
 
 def test_parse_cli_output() -> None:
-    payload = {"title": "t", "candidates": [], "selected_ids": [1]}
+    payload = {"candidates": [], "selected_ids": [1]}
     out1 = json.dumps({"type": "result", "subtype": "success", "is_error": False,
                        "result": "", "structured_output": payload})
     assert parse_cli_output(out1) == payload
@@ -110,7 +108,7 @@ if os.environ.get("FAKE_CLAUDE_OLD") and "--json-schema" in args:
     sys.stderr.write("error: unknown option '--json-schema'\n"); sys.exit(1)
 import re
 ids = sorted({{int(x) for x in re.findall(r"^#(\d+) ·", prompt, re.M)}})
-result = {{"title": "아침 출근길", "selected_ids": ids[:2],
+result = {{"selected_ids": ids[:2],
           "candidates": [{{"id": i, "score": 10 - i % 10, "reason": f"장면{{i}}", "caption": f"자막{{i}}"}} for i in ids]}}
 out = {{"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(result, ensure_ascii=False)}}
 if "--json-schema" in args:
@@ -145,7 +143,7 @@ def test_claude_code_backend(videos: list, tmp: Path) -> None:
     os.environ["ANTHROPIC_API_KEY"] = "sk-stale-key"  # 구독 모드에서는 Claude Code에 전달되면 안 됨
     try:
         hcfg = HighlightConfig(target_duration_sec=4.0, clip_duration_sec=2.0)
-        clips, title = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
+        clips = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
         calls = json.loads(log.read_text())
         assert len(calls) == 1
         args = calls[0]["args"]
@@ -156,14 +154,15 @@ def test_claude_code_backend(videos: list, tmp: Path) -> None:
         assert "candidates_01.jpg" in calls[0]["prompt"], "prompt must reference sheet file names"
         assert not calls[0]["has_api_key"], "ANTHROPIC_API_KEY must be stripped in subscription mode"
         used = [c for c in clips if c.included]
-        assert title == "아침 출근길" and len(used) == 2, (title, len(used))
+        assert len(used) == 2, len(used)
+        assert "title" not in RESULT_SCHEMA["properties"] and "제목" not in calls[0]["prompt"], "AI must not make titles"
         assert all(c.caption.startswith("자막") for c in clips)
-        print(f"[PASS] Claude Code backend: {len(clips)} candidates, {len(used)} picked, title='{title}'")
+        print(f"[PASS] Claude Code backend: {len(clips)} candidates, {len(used)} picked, no AI title")
 
         # 구버전 CLI(--json-schema 미지원) → 더 단순한 옵션으로 자동 재시도
         log.unlink()
         os.environ["FAKE_CLAUDE_OLD"] = "1"
-        clips2, _ = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
+        clips2 = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_CODE)
         calls = json.loads(log.read_text())
         assert len(calls) == 2 and "--json-schema" not in calls[1]["args"]
         assert sum(c.included for c in clips2) == 2
@@ -199,7 +198,7 @@ def test_claude_api_backend(videos: list, tmp: Path) -> None:
             captured["headers"] = dict(self.headers)
             captured["body"] = body
             n = sum(1 for blk in body["messages"][0]["content"] if blk["type"] == "image")
-            result = {"title": "해안 드라이브", "selected_ids": [1, 2],
+            result = {"selected_ids": [1, 2],
                       "candidates": [{"id": 1, "score": 9, "reason": "바다 풍경", "caption": "바다다"},
                                      {"id": 2, "score": 8, "reason": "커브길", "caption": "커브"}]}
             msg = {"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
@@ -223,7 +222,7 @@ def test_claude_api_backend(videos: list, tmp: Path) -> None:
     os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
     try:
         hcfg = HighlightConfig(target_duration_sec=4.0, clip_duration_sec=2.0)
-        clips, title = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_API, api_key="sk-test")
+        clips = ai_select_highlights(videos, hcfg, AiDirectorMode.CLAUDE_API, api_key="sk-test")
         body = captured["body"]
         assert captured["path"].startswith("/v1/messages"), captured["path"]
         assert body["model"] == "claude-opus-5-5"
@@ -232,12 +231,12 @@ def test_claude_api_backend(videos: list, tmp: Path) -> None:
         assert "server-side-fallback-2026-07-01" in captured["headers"].get("anthropic-beta", "")
         imgs = [b for b in body["messages"][0]["content"] if b["type"] == "image"]
         assert imgs and imgs[0]["source"]["media_type"] == "image/jpeg"
-        assert title == "해안 드라이브" and sum(c.included for c in clips) == 2
+        assert sum(c.included for c in clips) == 2
         print(f"[PASS] Claude API backend request shape ({len(imgs)} contact-sheet images, fallbacks, JSON schema)")
 
         # AI 자막을 넣은 세로 쇼츠 렌더링
         out = tmp / "ai_shorts.mp4"
-        render_highlight_shorts(clips, ShortsExportConfig(output_path=out, title_text=title,
+        render_highlight_shorts(clips, ShortsExportConfig(output_path=out,
                                                            show_captions=True, resolution="720p"))
         p = probe_video_file(out)
         assert (p.width, p.height) == (720, 1280) and 3.0 <= p.duration_sec <= 5.0, (p.width, p.height, p.duration_sec)
