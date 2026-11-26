@@ -344,8 +344,8 @@ class HighlightConfig:
 class ShortsExportConfig:
     output_path: Path
     layout: ShortsLayout = ShortsLayout.VERTICAL_BLUR
-    resolution: str = "1080p"             # "1080p" (1080x1920) / "720p" (720x1280)
-    fps: float = 30.0
+    resolution: str = "auto"              # "auto"(원본에 맞춤) / "2160p"(2160x3840) / "1440p" / "1080p" / "720p"
+    fps: float = 0.0                      # 0 = 원본 프레임레이트 유지(최대 60fps)
     audio_mode: ShortsAudioMode = ShortsAudioMode.ORIGINAL
     bgm_path: Optional[Path] = None
     bgm_volume: float = 0.6
@@ -355,5 +355,6 @@ class ShortsExportConfig:
     title_text: str = ""                  # 화면 상단 제목 (빈 문자열이면 표시 안 함)
     show_timestamp: bool = True           # 장면별 촬영 시각 표시
     show_captions: bool = False           # AI가 제안한 장면 자막 표시
+    auto_level: bool = True               # 카메라 기울기를 감지해 수평(지평선)을 자동으로 맞춤
     quality_preset: VideoQualityPreset = VideoQualityPreset.HIGH
     use_hw_accel: bool = True

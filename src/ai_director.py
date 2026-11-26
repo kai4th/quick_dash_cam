@@ -239,7 +239,11 @@ def build_prompt(
   - id: 후보 번호
   - score: 0~10 정수 (쇼츠에 넣을 가치)
   - reason: 장면을 설명하는 한국어 15자 이내 (예: "노을 진 해안도로", "터널 빠져나옴")
-  - caption: 쇼츠 화면에 띄울 짧은 한국어 자막 12자 이내, 이모지·특수문자 금지 (예: "바다가 보인다")
+  - caption: 화면 구석에 작게 띄울 한국어 자막. 담백한 짧은 명사구 2~8자, 이모지·느낌표·특수문자 금지
+    - 화면에 보이는 걸 그대로 읽지 말 것 (나쁜 예: "바다가 보인다", "차가 달린다", "도로 주행 중")
+    - 시간대·분위기·장소의 성격을 짧게 (좋은 예: "해 질 무렵", "한산한 국도", "터널을 지나", "비 갠 오후", "퇴근길")
+    - 과장·감탄·유행어 금지. 붙일 만한 말이 없으면 빈 문자열("")로 둬 (억지 자막보다 없는 게 나음)
+    - 고른 장면들끼리 같은 표현을 반복하지 말 것
 - selected_ids: 쇼츠에 넣을 후보 번호 정확히 {n_final}개
 - title: 쇼츠 제목 한국어 20자 이내, 이모지 금지
 """
@@ -327,7 +331,7 @@ def apply_ai_result(
             reason=_clean_text(item.get("reason"), 20) or c.reason,
             included=cid in chosen,
             ai_score=ai_score(cid) if cid in info else None,
-            caption=_clean_text(item.get("caption"), 16),
+            caption=_clean_text(item.get("caption"), 12).rstrip("!~.,"),
         ))
     return result, _clean_text(data.get("title"), 30)
 

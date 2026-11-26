@@ -434,9 +434,63 @@ def test_shorts_transitions() -> None:
         print("[PASS] Transition failure falls back to hard cuts with a warning")
 
 
+def test_horizon_leveling_and_quality() -> None:
+    from src.highlights import (
+        estimate_roll_angle, frame_roll_estimate, resolve_shorts_fps, resolve_shorts_resolution,
+    )
+
+    # 해상도·프레임레이트 자동 결정: 4K60 → 2160p/60, 1080p30 → 1080p/30, 120fps → 최대 60
+    def fake(w, h, fps):
+        return HighlightClip(VideoFileInfo(path=Path("x.mp4"), filename="x.mp4", width=w, height=h, fps=fps,
+                                           duration_sec=10.0), 0.0, 3.0)
+    assert resolve_shorts_resolution("auto", [fake(3840, 2160, 60)]) == "2160p"
+    assert resolve_shorts_resolution("auto", [fake(2560, 1440, 30)]) == "1440p"
+    assert resolve_shorts_resolution("auto", [fake(1920, 1080, 30)]) == "1080p"
+    assert resolve_shorts_resolution("720p", [fake(3840, 2160, 60)]) == "720p"
+    assert resolve_shorts_fps(0, [fake(3840, 2160, 59.94)]) == 59.94
+    assert resolve_shorts_fps(0, [fake(1920, 1080, 120)]) == 60.0
+    assert resolve_shorts_fps(30, [fake(3840, 2160, 60)]) == 30.0
+    print("[PASS] Auto shorts resolution (4K source -> 2160x3840) and source frame rate (max 60)")
+
+    with tempfile.TemporaryDirectory(prefix="qdc_level_") as tmp:
+        tmp_dir = Path(tmp)
+        src = tmp_dir / "VID_20261024_090000.mp4"
+        _create_synthetic_driving_video(src, duration_sec=32, fps=20)
+        results = {}
+        for deg in (3, -2):
+            rot = tmp_dir / f"rot_{deg}.mp4"
+            subprocess.run(
+                [get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src), "-vf",
+                 f"rotate={deg}*PI/180:ow=iw:oh=ih:c=black,scale=iw*1.12:-2,crop=640:360",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy", str(rot)],
+                check=True, creationflags=get_CreationFlags(),
+            )
+            v = probe_video_file(rot)
+            angle, conf = estimate_roll_angle(v)
+            assert abs(angle - deg) < 0.6 and conf >= 0.5, f"rotated {deg} deg -> estimated {angle:.2f} (conf {conf:.2f})"
+            out = tmp_dir / f"leveled_{deg}.mp4"
+            notes: list = []
+            render_highlight_shorts([HighlightClip(v, 16.0, 19.0)], ShortsExportConfig(
+                output_path=out, layout=ShortsLayout.LANDSCAPE, resolution="720p", show_timestamp=False,
+            ), notes=notes)
+            raw = subprocess.run(
+                [get_ffmpeg_exe(), "-loglevel", "error", "-ss", "1.5", "-i", str(out), "-frames:v", "1",
+                 "-vf", "scale=640:360", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                stdout=subprocess.PIPE, check=True, creationflags=get_CreationFlags(),
+            ).stdout
+            after, _n = frame_roll_estimate(np.frombuffer(raw, dtype=np.uint8).reshape(360, 640))
+            assert after is not None and abs(after) < 0.6, f"leveled output still tilted: {after}"
+            assert notes and "바로잡음" in notes[0], notes
+            results[deg] = (round(angle, 2), round(after, 2))
+        straight, _c = estimate_roll_angle(probe_video_file(src))
+        assert abs(straight) < 0.3, f"level footage must not be rotated: {straight}"
+        print("[PASS] Horizon leveling (tilt -> estimated, after):", results)
+
+
 if __name__ == "__main__":
     test_sorter()
     test_analysis_and_export()
     test_highlight_shorts()
     test_shorts_transitions()
+    test_horizon_leveling_and_quality()
     print("ALL TESTS PASSED SUCCESSFULLY!")

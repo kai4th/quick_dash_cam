@@ -11,10 +11,14 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import json
+import math
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -749,15 +753,52 @@ def select_diverse_highlights(
 
 # ── 쇼츠 렌더링 ──
 
+SHORTS_SIZES = {"2160p": (2160, 3840), "1440p": (1440, 2560), "1080p": (1080, 1920), "720p": (720, 1280)}
+
+
+def resolve_shorts_resolution(resolution: str, clips: List[HighlightClip]) -> str:
+    """'auto'면 원본 화질에 맞춤: 4K 원본 → 2160p, 1440p 원본 → 1440p, 그 외 1080p."""
+    if resolution != "auto":
+        return resolution if resolution in SHORTS_SIZES else "1080p"
+    src_h = max((min(c.video.width, c.video.height) for c in clips), default=1080)
+    if src_h >= 2000:
+        return "2160p"
+    if src_h >= 1400:
+        return "1440p"
+    return "1080p"
+
+
+def resolve_shorts_fps(fps: float, clips: List[HighlightClip]) -> float:
+    """0이면 원본 프레임레이트 유지 (최대 60fps, 29.97/59.94 같은 값도 그대로)."""
+    if fps > 0:
+        return float(fps)
+    src = max((c.video.fps for c in clips if 10.0 <= c.video.fps <= 240.0), default=30.0)
+    return float(min(60.0, src))
+
+
 def shorts_dimensions(layout: ShortsLayout, resolution: str) -> Tuple[int, int]:
-    small = resolution == "720p"
+    w, h = SHORTS_SIZES.get(resolution, SHORTS_SIZES["1080p"])
     if layout == ShortsLayout.LANDSCAPE:
-        return (1280, 720) if small else (1920, 1080)
-    return (720, 1280) if small else (1080, 1920)
+        return h, w
+    return w, h
 
 
-def _find_overlay_font(need_cjk: bool) -> Optional[str]:
-    """오버레이 텍스트용 글꼴 경로 (한글 제목이면 한글 글꼴 우선)."""
+def _find_overlay_font(need_cjk: bool, bold: bool = True) -> Optional[str]:
+    """오버레이 텍스트용 글꼴 경로 (한글이면 한글 글꼴 우선, bold=False면 보통 굵기 우선)."""
+    if not bold:
+        regular = [
+            "C:/Windows/Fonts/malgun.ttf",
+            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        ] + ([] if need_cjk else [
+            "C:/Windows/Fonts/segoeui.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ])
+        for fp in regular:
+            if os.path.exists(fp):
+                return fp
     cjk = [
         "C:/Windows/Fonts/malgunbd.ttf",
         "C:/Windows/Fonts/malgun.ttf",
@@ -803,15 +844,175 @@ def clip_timestamp_text(clip: HighlightClip) -> Optional[str]:
     return t.strftime("%Y.%m.%d  %H:%M:%S")
 
 
-def _drawtext(font: str, text_file: Path, fontsize: int, y: str, boxed: bool) -> str:
+def _drawtext(
+    font: str,
+    text_file: Path,
+    fontsize: int,
+    y: str,
+    boxed: bool,
+    x: str = "(w-tw)/2",
+    alpha: Optional[str] = None,
+    soft: bool = False,
+) -> str:
+    color = "white@0.92" if soft else "white"
     base = (
         f"drawtext=fontfile='{_filter_path(font)}':textfile='{_filter_path(text_file)}':expansion=none:"
-        f"fontsize={fontsize}:fontcolor=white:x=(w-tw)/2:y={y}"
+        f"fontsize={fontsize}:fontcolor={color}:x={x}:y={y}"
     )
+    if alpha:
+        base += f":alpha='{alpha}'"
+    if soft:
+        # 작고 은은한 자막: 얇은 외곽선 + 옅은 그림자 (밝은 하늘 위에서도 읽히는 정도)
+        return base + ":borderw=1:bordercolor=black@0.35:shadowcolor=black@0.45:shadowx=1:shadowy=2"
     if boxed:
         pad = max(6, fontsize // 3)
         return base + f":box=1:boxcolor=black@0.45:boxborderw={pad}"
     return base + ":shadowcolor=black@0.7:shadowx=3:shadowy=3"
+
+
+def _overlay_alpha(t1: float, t2: float, fade: float = 0.3) -> Optional[str]:
+    """컷 안에서 [t1, t2] 동안만 서서히 나타났다 사라지는 투명도 식 (디졸브로 겹치는 구간에는 숨김)."""
+    if t2 - t1 < 0.6:
+        return None
+    f = min(fade, (t2 - t1) / 3.0)
+    return (
+        f"if(lt(t,{t1:.3f}),0,if(lt(t,{t1 + f:.3f}),(t-{t1:.3f})/{f:.3f},"
+        f"if(lt(t,{t2 - f:.3f}),1,if(lt(t,{t2:.3f}),({t2:.3f}-t)/{f:.3f},0))))"
+    )
+
+
+# ── 수평(지평선) 자동 보정 ──
+
+ROLL_CACHE_VERSION = "roll_v1"
+ROLL_SAMPLE_FRAMES = 18
+ROLL_MAX_DEG = 8.0
+ROLL_MIN_APPLY_DEG = 0.3
+
+
+def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    order = np.argsort(values)
+    v, w = values[order], weights[order]
+    cw = np.cumsum(w)
+    return float(v[int(np.searchsorted(cw, cw[-1] / 2.0))])
+
+
+def frame_roll_estimate(gray: np.ndarray) -> Tuple[Optional[float], int]:
+    """
+    한 프레임의 카메라 기울기(도) 추정. 건물 가장자리·전봇대(수직선), 지평선·보닛·건물 처마(수평선)처럼
+    수평/수직에서 ±10° 이내인 직선들이 기준축에서 얼마나 틀어졌는지를 길이 가중 중앙값으로 구합니다.
+    (+값 = 화면이 시계 방향으로 기울어짐) 반환: (각도 또는 None, 사용한 직선 수)
+    """
+    import cv2
+
+    h, w = gray.shape[:2]
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 60, 160)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=40,
+                            minLineLength=max(20, int(w * 0.12)), maxLineGap=6)
+    if lines is None:
+        return None, 0
+    devs: List[float] = []
+    weights: List[float] = []
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):  # OpenCV 버전에 따라 (N,1,4) 또는 (N,4)
+        dx, dy = float(x2 - x1), float(y2 - y1)
+        length = math.hypot(dx, dy)
+        a = math.degrees(math.atan2(dy, dx))
+        if a <= -90.0:
+            a += 180.0
+        elif a > 90.0:
+            a -= 180.0
+        if abs(a) <= 10.0:
+            dev = a
+        elif abs(a) >= 80.0:
+            dev = a - 90.0 if a > 0 else a + 90.0
+        else:
+            continue  # 차선처럼 비스듬한 선은 원근 때문에 기울기 판단에 쓰지 않음
+        devs.append(dev)
+        weights.append(length)
+    if len(devs) < 8:
+        return None, len(devs)
+    return _weighted_median(np.array(devs), np.array(weights)), len(devs)
+
+
+def _roll_cache_path(video_path: Path) -> Optional[Path]:
+    try:
+        st = video_path.stat()
+        key = f"{ROLL_CACHE_VERSION}|{video_path.resolve()}|{st.st_size}|{int(st.st_mtime)}"
+        digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+        cache_dir = Path(tempfile.gettempdir()) / "quick_dash_cam_fcache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"roll_{digest}.json"
+    except Exception:
+        return None
+
+
+def estimate_roll_angle(
+    video: VideoFileInfo,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> Tuple[float, float]:
+    """
+    영상 하나의 카메라 기울기(도)와 신뢰도(0~1). 카메라는 차에 고정돼 있으므로 영상 전체에서 프레임 18장을 뽑아
+    각 프레임 추정값의 중앙값을 씁니다 (커브·경사로에서의 순간 기울기는 무시됨).
+    직선이 부족하거나(야간 등) 프레임마다 값이 들쭉날쭉하면 (0, 낮은 신뢰도)를 돌려줘 보정하지 않게 합니다.
+    """
+    cache = _roll_cache_path(video.path)
+    if cache is not None and cache.exists():
+        try:
+            d = json.loads(cache.read_text(encoding="utf-8"))
+            return float(d["angle"]), float(d["confidence"])
+        except Exception:
+            pass
+    sw = 640
+    sh = max(2, int(round(sw * max(1, video.height) / max(1, video.width) / 2)) * 2)
+    dur = max(0.5, video.duration_sec)
+    times = [dur * (0.05 + 0.9 * k / max(1, ROLL_SAMPLE_FRAMES - 1)) for k in range(ROLL_SAMPLE_FRAMES)]
+    ffmpeg = get_ffmpeg_exe()
+
+    def grab(t: float) -> Optional[np.ndarray]:
+        if cancel_check and cancel_check():
+            return None
+        try:
+            res = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", str(video.path),
+                 "-frames:v", "1", "-vf", f"scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, creationflags=get_CreationFlags(),
+            )
+            if len(res.stdout) >= sw * sh:
+                return np.frombuffer(res.stdout[: sw * sh], dtype=np.uint8).reshape(sh, sw)
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        frames = list(pool.map(grab, times))
+    ests = [e for e, _n in (frame_roll_estimate(f) for f in frames if f is not None) if e is not None]
+    if len(ests) < 4:
+        angle, conf = 0.0, 0.0
+    else:
+        med = float(np.median(ests))
+        conf = float(np.mean([abs(e - med) <= 1.0 for e in ests]))
+        angle = float(np.clip(med, -ROLL_MAX_DEG, ROLL_MAX_DEG)) if conf >= 0.4 else 0.0
+    if cache is not None and not (cancel_check and cancel_check()):
+        try:
+            cache.write_text(json.dumps({"angle": angle, "confidence": conf, "frames": len(ests)}), encoding="utf-8")
+        except Exception:
+            pass
+    return angle, conf
+
+
+def _level_chain(v: VideoFileInfo, deg: float, out_w: int, out_h: int) -> str:
+    """기울기 deg만큼 반대로 돌리고, 모서리 빈 공간이 안 보이게 살짝 확대해 원래 비율로 잘라내는 필터."""
+    if abs(deg) < ROLL_MIN_APPLY_DEG or v.width <= 0 or v.height <= 0:
+        return ""
+    pw = int(min(v.width, max(640, out_w, out_h))) // 2 * 2  # 4K 원본은 먼저 줄여서 회전 비용 절감
+    ph = max(2, int(round(pw * v.height / v.width / 2)) * 2)
+    th = math.radians(abs(deg))
+    zoom = math.cos(th) + max(pw / ph, ph / pw) * math.sin(th)
+    zw, zh = int(math.ceil(pw * zoom / 2)) * 2, int(math.ceil(ph * zoom / 2)) * 2
+    # rotate 필터는 양수=시계 방향 → 감지된 기울기의 반대 방향으로 회전
+    return (
+        f"scale={pw}:{ph}:flags=lanczos,rotate={-math.radians(deg):.6f}:ow=iw:oh=ih:c=black,"
+        f"scale={zw}:{zh}:flags=lanczos,crop={pw}:{ph}"
+    )
 
 
 def _build_clip_filtergraph(
@@ -829,22 +1030,27 @@ def _build_clip_filtergraph(
     font_caption: Optional[str] = None,
     fade_in: float = 0.0,
     fade_out: float = 0.0,
+    overlay_window: Optional[Tuple[float, float]] = None,
+    level_deg: float = 0.0,
 ) -> str:
     v = clip.video
+    level = _level_chain(v, level_deg, out_w, out_h)
+    prefix = f"[0:v]{level}[lv];" if level else ""
+    src = "[lv]" if level else "[0:v]"
     if cfg.layout == ShortsLayout.VERTICAL_BLUR:
         bw, bh = max(2, (out_w // 4) // 2 * 2), max(2, (out_h // 4) // 2 * 2)
         graph = (
-            f"[0:v]split=2[bg][fg];"
+            f"{prefix}{src}split=2[bg][fg];"
             f"[bg]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},"
             f"boxblur=8:2,scale={out_w}:{out_h},eq=brightness=-0.10[bgb];"
-            f"[fg]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:force_divisible_by=2[fgs];"
+            f"[fg]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos[fgs];"
             f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2"
         )
     elif cfg.layout == ShortsLayout.VERTICAL_CROP:
-        graph = f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,crop={out_w}:{out_h}"
+        graph = f"{prefix}{src}scale={out_w}:{out_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={out_w}:{out_h}"
     else:
         graph = (
-            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"{prefix}{src}scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2"
         )
 
@@ -866,23 +1072,26 @@ def _build_clip_filtergraph(
             y = f"{out_h * 0.06:.0f}"
         graph += "," + _drawtext(font_title, title_file, fs, y, boxed=not use_band)
 
+    # 장면 자막·촬영 시각은 컷 중간에만 서서히 나타났다 사라지게 (디졸브로 겹치는 동안 앞뒤 글자가 섞이지 않게)
+    alpha = _overlay_alpha(*overlay_window) if overlay_window else None
+
     has_caption = caption_file is not None and bool(font_caption) and bool(clip.caption.strip())
     if has_caption:
-        base_fs = out_w * (0.065 if vertical else 0.036)
-        fs = int(max(16, min(base_fs, 0.88 * out_w / _text_units(clip.caption.strip()))))
-        if use_band:
-            y = f"{out_h - band + band * 0.14:.0f}"
-        else:
-            y = f"{out_h * 0.78:.0f}"
-        graph += "," + _drawtext(font_caption, caption_file, fs, y, boxed=not use_band)  # type: ignore[arg-type]
+        # 작고 깔끔한 자막: 영상 왼쪽 아래 구석에 보통 굵기 글씨로 은은하게
+        fs = int(max(14, out_w * (0.036 if vertical else 0.020)))
+        margin_x = int(out_w * 0.05)
+        video_bottom = (out_h + fg_h) / 2.0 if cfg.layout == ShortsLayout.VERTICAL_BLUR else out_h * (0.86 if vertical else 0.88)
+        y = f"{video_bottom - fs - out_h * (0.018 if vertical else 0.03):.0f}"
+        graph += "," + _drawtext(font_caption, caption_file, fs, y, boxed=False,  # type: ignore[arg-type]
+                                 x=str(margin_x), alpha=alpha, soft=True)
 
     if ts_file is not None and font_ts:
         fs = int(max(14, out_w * (0.042 if vertical else 0.022)))
         if use_band:
-            y = f"{out_h - band + band * (0.50 if has_caption else 0.25):.0f}"
+            y = f"{out_h - band + band * 0.25:.0f}"
         else:
             y = f"{out_h * 0.90:.0f}"
-        graph += "," + _drawtext(font_ts, ts_file, fs, y, boxed=not use_band)
+        graph += "," + _drawtext(font_ts, ts_file, fs, y, boxed=not use_band, alpha=alpha)
 
     # 컷 사이 전환은 이어 붙이는 단계(xfade)에서 처리하고, 여기서는 쇼츠 맨 처음/맨 끝 페이드만 적용
     if fade_in > 0 and out_dur > fade_in * 2:
@@ -942,11 +1151,13 @@ def _encode_highlight_clip(
     dur: Optional[float] = None,
     fade_in: float = 0.0,
     fade_out: float = 0.0,
+    overlay_window: Optional[Tuple[float, float]] = None,
+    level_deg: float = 0.0,
 ) -> Tuple[bool, str]:
     dur = clip.duration if dur is None else dur
     graph = _build_clip_filtergraph(
         clip, cfg, out_w, out_h, dur, title_file, cfg.title_text.strip(), ts_file, font_title, font_ts,
-        caption_file, font_caption, fade_in, fade_out,
+        caption_file, font_caption, fade_in, fade_out, overlay_window, level_deg,
     )
     cmd: List[str] = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
@@ -1090,6 +1301,7 @@ def render_highlight_shorts(
     progress_callback: Optional[Callable[[float, str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     warnings: Optional[List[str]] = None,
+    notes: Optional[List[str]] = None,
 ) -> Path:
     """
     선정된 하이라이트 장면들을 쇼츠 영상(MP4) 하나로 만듭니다.
@@ -1104,6 +1316,12 @@ def render_highlight_shorts(
         raise ValueError("배경음악 파일을 선택해 주세요.")
 
     ffmpeg = get_ffmpeg_exe()
+    # 해상도·프레임레이트 확정 ('auto'/0 → 원본에 맞춤). 이후 단계는 확정된 값을 씀
+    cfg = dataclasses.replace(
+        cfg,
+        resolution=resolve_shorts_resolution(cfg.resolution, use_clips),
+        fps=resolve_shorts_fps(cfg.fps, use_clips),
+    )
     out_w, out_h = shorts_dimensions(cfg.layout, cfg.resolution)
     enc_name, enc_args = resolve_video_encoder(VideoCodec.H264, cfg.quality_preset, prefer_hw=cfg.use_hw_accel)
     sw_name, sw_args = get_software_encoder_args(VideoCodec.H264, cfg.quality_preset)
@@ -1115,7 +1333,7 @@ def render_highlight_shorts(
     font_title = _find_overlay_font(need_cjk=any(ord(ch) >= 0x2E80 for ch in title)) if title else None
     font_ts = _find_overlay_font(need_cjk=False) if cfg.show_timestamp else None
     font_caption = (
-        _find_overlay_font(need_cjk=True)
+        _find_overlay_font(need_cjk=True, bold=False)
         if cfg.show_captions and any(c.caption.strip() for c in use_clips) else None
     )
 
@@ -1133,6 +1351,26 @@ def render_highlight_shorts(
     total_dur = sum(seg_durs) - trans * (n - 1)
     done_dur = 0.0
     encode_share = 0.8 if use_xfade else 0.9
+
+    # 수평 자동 보정: 쇼츠에 쓰이는 영상마다 카메라 기울기 추정 (디스크 캐시)
+    level_by_video: Dict[int, float] = {}
+    if cfg.auto_level:
+        uniq: List[VideoFileInfo] = []
+        for c in use_clips:
+            if all(c.video is not u for u in uniq):
+                uniq.append(c.video)
+        for k, v in enumerate(uniq):
+            if cancel_check and cancel_check():
+                raise RuntimeError("사용자에 의해 작업이 취소되었습니다.")
+            if progress_callback:
+                progress_callback(0.0, f"수평(지평선) 기울기 확인 중 [{k + 1}/{len(uniq)}]: {v.filename}")
+            angle, conf = estimate_roll_angle(v, cancel_check)
+            level_by_video[id(v)] = angle
+            if notes is not None:
+                if abs(angle) >= ROLL_MIN_APPLY_DEG:
+                    notes.append(f"수평 보정: {v.filename} {angle:+.1f}° 기울어짐 → 바로잡음")
+                elif conf < 0.4:
+                    notes.append(f"수평 보정: {v.filename} 직선이 부족해 판단하기 어려워 그대로 둠")
 
     with tempfile.TemporaryDirectory(prefix="quick_dash_cam_shorts_") as tmp_str:
         tmp = Path(tmp_str)
@@ -1166,10 +1404,14 @@ def render_highlight_shorts(
             seg_path = tmp / f"hl_{idx:04d}.ts"
             args = (ffmpeg, clip, cfg, seg_path, out_w, out_h)
             extra = (clip_audio, title_file, ts_file, font_title, font_ts, cancel_check, caption_file, font_caption)
+            t_in = trans if idx > 0 else 0.0
+            t_out = trans if idx < n - 1 else 0.0
             timing = dict(
                 dur=seg_durs[idx],
                 fade_in=cfg.fade_sec if idx == 0 else 0.0,
                 fade_out=cfg.fade_sec if idx == n - 1 else 0.0,
+                overlay_window=(t_in + 0.15, seg_durs[idx] - t_out - 0.1),
+                level_deg=level_by_video.get(id(clip.video), 0.0),
             )
             ok, err = _encode_highlight_clip(*args, enc_name, enc_args, *extra, **timing)
             if not ok and enc_name != sw_name and not (cancel_check and cancel_check()):

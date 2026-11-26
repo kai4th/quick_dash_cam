@@ -2741,9 +2741,14 @@ class QuickDashCamApp(ctk.CTk):
             row1, values=["세로 9:16 · 흐림 배경 (권장)", "세로 9:16 · 꽉 채우기", "가로 16:9"],
             variable=self.shorts_layout_var, width=168, height=24, font=small,
         ).pack(side="left", padx=(0, 8))
-        self.shorts_res_var = ctk.StringVar(value="1080p")
+        self.shorts_res_var = ctk.StringVar(value="자동 (원본 화질)")
         ctk.CTkOptionMenu(
-            row1, values=["1080p", "720p"], variable=self.shorts_res_var, width=66, height=24, font=small,
+            row1, values=["자동 (원본 화질)", "4K (2160×3840)", "1440p (1440×2560)", "1080p (1080×1920)", "720p (720×1280)"],
+            variable=self.shorts_res_var, width=128, height=24, font=small,
+        ).pack(side="left", padx=(0, 4))
+        self.shorts_fps_var = ctk.StringVar(value="원본 fps")
+        ctk.CTkOptionMenu(
+            row1, values=["원본 fps", "60fps", "30fps"], variable=self.shorts_fps_var, width=84, height=24, font=small,
         ).pack(side="left")
 
         row2 = ctk.CTkFrame(opts, fg_color="transparent")
@@ -2774,6 +2779,11 @@ class QuickDashCamApp(ctk.CTk):
         row3 = ctk.CTkFrame(opts, fg_color="transparent")
         row3.pack(fill="x", padx=6, pady=(1, 4))
         ctk.CTkLabel(row3, text="제목", font=small).pack(side="left", padx=(0, 3))
+        self.shorts_level_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            row3, text="수평 자동 보정", variable=self.shorts_level_var, font=ctk.CTkFont(size=10),
+            checkbox_width=16, checkbox_height=16,
+        ).pack(side="right", padx=(6, 0))
         self.shorts_title_entry = ctk.CTkEntry(
             row3, height=24, font=small,
             placeholder_text="화면 상단에 넣을 제목 (예: 출근길 하이라이트) — 비워두면 표시 안 함",
@@ -2930,11 +2940,21 @@ class QuickDashCamApp(ctk.CTk):
         except ValueError:
             transition_sec = 0.5
 
+        res_txt = self.shorts_res_var.get()
+        resolution = "auto"
+        for key, tag in (("2160p", "4K"), ("1440p", "1440p"), ("1080p", "1080p"), ("720p", "720p")):
+            if res_txt.startswith(tag):
+                resolution = key
+        fps_txt = self.shorts_fps_var.get()
+        fps = 60.0 if fps_txt.startswith("60") else (30.0 if fps_txt.startswith("30") else 0.0)
+
         base = self._get_current_export_config(output_path)
         return ShortsExportConfig(
             output_path=output_path,
             layout=layout,
-            resolution=self.shorts_res_var.get(),
+            resolution=resolution,
+            fps=fps,
+            auto_level=bool(self.shorts_level_var.get()),
             audio_mode=audio_mode,
             bgm_path=self.shorts_bgm_path,
             title_text=self.shorts_title_entry.get().strip(),
@@ -3356,9 +3376,10 @@ class QuickDashCamApp(ctk.CTk):
                     ))
 
                 render_warnings: List[str] = []
+                render_notes: List[str] = []
                 final_path = render_highlight_shorts(
                     use, shorts_cfg, progress_callback=on_prog, cancel_check=lambda: self.cancel_requested,
-                    warnings=render_warnings,
+                    warnings=render_warnings, notes=render_notes,
                 )
 
                 def on_success():
@@ -3366,7 +3387,8 @@ class QuickDashCamApp(ctk.CTk):
                     self.progress_bar.set(1.0)
                     self.btn_open_folder.configure(state="normal")
                     self._set_busy_state(False, f"✅ 쇼츠 완성! 저장된 파일: {final_path}")
-                    note = ("\n\n⚠ " + "\n⚠ ".join(render_warnings)) if render_warnings else ""
+                    note = ("\n\n" + "\n".join(render_notes)) if render_notes else ""
+                    note += ("\n\n⚠ " + "\n⚠ ".join(render_warnings)) if render_warnings else ""
                     (messagebox.showwarning if render_warnings else messagebox.showinfo)(
                         "쇼츠 완성",
                         f"하이라이트 쇼츠 영상이 완성되었습니다!\n\n장면 {len(use)}개 · 약 "
