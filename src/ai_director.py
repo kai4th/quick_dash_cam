@@ -39,6 +39,15 @@ FRAME_W, FRAME_H = 384, 216
 LABEL_W = 64
 CANDIDATES_PER_SHEET = 6
 
+# ── 앞차 가림 감점 (조정용 상수) ──
+# Claude가 후보마다 '앞차(앞서 가는 차·트럭·버스)가 화면에서 차지하는 비율'을 0~100%로 어림해서 알려주면,
+# 그 비율이 START 이상일 때부터 AI 점수(0~10)를 깎고 FULL 이상이면 최대치(MAX_PENALTY)만큼 깎는다.
+# (사이 구간은 선형) 앞차가 화면을 가리면 풍경이 안 보이고, 정차 후 출발하는 장면일 가능성도 높다.
+LEAD_CAR_PENALTY_START_PCT = 30.0   # 이 비율 이하는 감점 없음 (멀리 보이는 앞차·작게 보이는 차)
+LEAD_CAR_PENALTY_FULL_PCT = 60.0    # 이 비율 이상이면 최대 감점 ("화면의 대부분")
+LEAD_CAR_MAX_PENALTY = 6.0          # 최대 감점 (AI 점수 0~10 기준)
+MIN_FILL_AI_SCORE = 5.0             # AI 점수가 모자란 선정을 채울 때 쓰는 최소 점수
+
 ProgressFn = Callable[[float, str], None]
 CancelFn = Callable[[], bool]
 
@@ -54,8 +63,9 @@ RESULT_SCHEMA: Dict = {
                     "score": {"type": "integer"},
                     "reason": {"type": "string"},
                     "caption": {"type": "string"},
+                    "lead_car_pct": {"type": "integer"},
                 },
-                "required": ["id", "score", "reason", "caption"],
+                "required": ["id", "score", "reason", "caption", "lead_car_pct"],
                 "additionalProperties": False,
             },
         },
@@ -234,7 +244,8 @@ def build_prompt(
 ## 피할 장면
 - 좌회전·우회전·유턴·차선 변경처럼 방향이 바뀌는 장면
 - 주차장·지하주차장·골목·주차장 출입구, 아주 천천히 움직이는 장면
-- 정체로 거의 멈춰 있는 장면
+- 정체로 거의 멈춰 있는 장면, 신호 대기 중 멈춰 있다가 출발하는 장면 (사진 3장에서 앞차가 거의 그대로이거나 막 움직이기 시작하는 모습)
+- 앞차(앞서 가는 승용차·트럭·버스)가 화면의 큰 부분을 차지해 도로와 풍경이 가려진 장면 — 아래 lead_car_pct로 알려줘
 - 너무 어둡거나 흐리거나 역광·유리 반사가 심해 알아보기 힘든 장면
 - 선택한 장면들이 한 시간대에 몰리지 않고 주행 전체에 고루 퍼지면 더 좋아
 
@@ -243,6 +254,9 @@ def build_prompt(
   - id: 후보 번호
   - score: 0~10 정수 (쇼츠에 넣을 가치)
   - reason: 장면을 설명하는 한국어 15자 이내 (예: "노을 진 해안도로", "시원한 고속도로")
+  - lead_car_pct: 한 줄의 사진 3장 중 앞차가 가장 크게 보이는 사진에서, 앞차가 화면 전체에서 차지하는 비율(0~100 정수)
+    - 앞차가 없거나 멀리 작게 보이면 0~10, 화면 폭의 절반쯤을 가리면 40~60, 화면 대부분을 가리면 70 이상
+    - 이 값이 클수록 프로그램이 점수를 깎으니, 점수(score)는 앞차 가림과 상관없이 장면 자체의 가치로만 매겨
   - caption: 화면 구석에 작게 띄울 한국어 자막. 담백한 짧은 명사구 2~8자, 이모지·느낌표·특수문자 금지
     - 화면에 보이는 걸 그대로 읽지 말 것 (나쁜 예: "바다가 보인다", "차가 달린다", "도로 주행 중")
     - 시간대·분위기·장소의 성격을 짧게 (좋은 예: "해 질 무렵", "한산한 국도", "터널을 지나", "비 갠 오후", "퇴근길")
@@ -276,6 +290,19 @@ def _clean_text(text: object, limit: int) -> str:
     return s[:limit].strip()
 
 
+def lead_car_penalty(pct: object) -> float:
+    """앞차가 화면에서 차지하는 비율(%)에 따른 AI 점수 감점량 (0 ~ LEAD_CAR_MAX_PENALTY). 값이 없거나 이상하면 0."""
+    try:
+        v = float(pct)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:  # NaN
+        return 0.0
+    span = max(1e-6, LEAD_CAR_PENALTY_FULL_PCT - LEAD_CAR_PENALTY_START_PCT)
+    t = (min(100.0, max(0.0, v)) - LEAD_CAR_PENALTY_START_PCT) / span
+    return LEAD_CAR_MAX_PENALTY * min(1.0, max(0.0, t))
+
+
 def apply_ai_result(
     data: Dict,
     candidates: Sequence[HighlightClip],
@@ -300,10 +327,15 @@ def apply_ai_result(
             info[cid] = item
 
     def ai_score(cid: int) -> float:
+        """AI 점수(0~10) − 앞차 가림 감점. 평가가 없는 후보는 -1."""
         try:
-            return float(max(0.0, min(10.0, float(info[cid].get("score", 0)))))
+            raw = float(max(0.0, min(10.0, float(info[cid].get("score", 0)))))
         except (KeyError, TypeError, ValueError):
             return -1.0
+        return max(0.0, raw - lead_car_penalty(info[cid].get("lead_car_pct")))
+
+    def penalized(cid: int) -> bool:
+        return cid in info and lead_car_penalty(info[cid].get("lead_car_pct")) > 0.0
 
     selected: List[int] = []
     for raw in data.get("selected_ids") or []:
@@ -317,9 +349,16 @@ def apply_ai_result(
         selected = sorted(selected, key=lambda c: -ai_score(c))[:n_final]
     if len(selected) < n_final:
         # Claude가 덜 골랐으면 AI 점수 5점 이상(또는 평가가 빠진) 후보로만 채움 — 낮게 평가한 장면은 억지로 넣지 않음
-        rest = [c for c in range(1, n + 1) if c not in selected and (c not in info or ai_score(c) >= 5.0)]
+        rest = [c for c in range(1, n + 1) if c not in selected and (c not in info or ai_score(c) >= MIN_FILL_AI_SCORE)]
         rest.sort(key=lambda c: (-ai_score(c), -candidates[c - 1].score))
         selected += rest[: n_final - len(selected)]
+    # 앞차에 가려 감점된 장면은, 감점 후에도 더 높은 점수의 다른 후보가 있으면 그 후보로 교체
+    for cid in sorted((c for c in selected if penalized(c)), key=ai_score):
+        spare = [c for c in range(1, n + 1)
+                 if c not in selected and c in info and not penalized(c) and ai_score(c) >= max(MIN_FILL_AI_SCORE, ai_score(cid))]
+        if spare:
+            best = max(spare, key=lambda c: (ai_score(c), candidates[c - 1].score))
+            selected[selected.index(cid)] = best
 
     chosen = set(selected)
     result: List[HighlightClip] = []
