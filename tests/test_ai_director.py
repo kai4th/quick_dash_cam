@@ -24,6 +24,10 @@ from src.ai_director import (  # noqa: E402
     ai_select_highlights,
     candidate_count_for,
     apply_ai_result,
+    lead_car_penalty,
+    LEAD_CAR_MAX_PENALTY,
+    LEAD_CAR_PENALTY_FULL_PCT,
+    LEAD_CAR_PENALTY_START_PCT,
     parse_cli_output,
 )
 from src.analyzer import analyze_video  # noqa: E402
@@ -65,6 +69,43 @@ def test_apply_ai_result() -> None:
     assert clips[2].caption == "바다가 보인다", clips[2].caption
     assert clips[0].ai_score is None and clips[0].reason == "회전·커브", "unrated candidates keep algorithm reason"
     print("[PASS] AI result validation (unknown ids, duplicates, clamping, fill, emoji strip)")
+
+
+def test_lead_car_penalty() -> None:
+    assert lead_car_penalty(None) == 0.0 and lead_car_penalty("x") == 0.0 and lead_car_penalty(float("nan")) == 0.0
+    assert lead_car_penalty(0) == 0.0 and lead_car_penalty(LEAD_CAR_PENALTY_START_PCT) == 0.0
+    assert lead_car_penalty(LEAD_CAR_PENALTY_FULL_PCT) == LEAD_CAR_MAX_PENALTY
+    assert lead_car_penalty(100) == LEAD_CAR_MAX_PENALTY and lead_car_penalty(500) == LEAD_CAR_MAX_PENALTY
+    mid = (LEAD_CAR_PENALTY_START_PCT + LEAD_CAR_PENALTY_FULL_PCT) / 2
+    assert abs(lead_car_penalty(mid) - LEAD_CAR_MAX_PENALTY / 2) < 1e-6
+    # 앞차 비율이 커질수록 감점은 줄지 않는다
+    vals = [lead_car_penalty(p) for p in range(0, 101, 5)]
+    assert vals == sorted(vals)
+
+    # 컷 판정: 점수는 높지만 앞차가 화면 대부분을 가린 후보는 감점되어 다른 후보로 교체됨
+    cands = _fake_candidates(6)
+    data = {
+        "candidates": [
+            {"id": 1, "score": 10, "reason": "앞차 뒤꽁무니", "caption": "", "lead_car_pct": 80},   # 10 → 4
+            {"id": 2, "score": 8, "reason": "시원한 국도", "caption": "", "lead_car_pct": 0},
+            {"id": 3, "score": 7, "reason": "해안도로", "caption": "", "lead_car_pct": 10},
+            {"id": 4, "score": 9, "reason": "정체 구간", "caption": "", "lead_car_pct": 45},      # 9 → 5.0
+            {"id": 5, "score": 6, "reason": "산길", "caption": "", "lead_car_pct": 0},
+            {"id": 6, "score": 3, "reason": "주차장", "caption": "", "lead_car_pct": 0},
+        ],
+        "selected_ids": [1, 2, 4],
+    }
+    clips = apply_ai_result(data, cands, n_final=3)
+    chosen = [i + 1 for i, c in enumerate(clips) if c.included]
+    assert 1 not in chosen, f"lead-car-dominated cut must be replaced: {chosen}"
+    assert chosen == [2, 3, 5], chosen  # 1(→4점)·4(→5점, 더 나은 5번이 있음)가 빠지고 3·5가 들어옴
+    assert clips[0].ai_score == 10 - LEAD_CAR_MAX_PENALTY == 4.0, clips[0].ai_score
+    # 앞차 정보가 없는(구버전 응답) 후보는 기존과 똑같이 동작
+    for item in data["candidates"]:
+        item.pop("lead_car_pct")
+    clips = apply_ai_result(data, cands, n_final=3)
+    assert [i + 1 for i, c in enumerate(clips) if c.included] == [1, 2, 4]
+    print("[PASS] Lead-car occlusion penalty (thresholds, replacement, legacy responses)")
 
 
 def test_candidate_counts() -> None:
@@ -252,6 +293,7 @@ def test_claude_api_backend(videos: list, tmp: Path) -> None:
 
 if __name__ == "__main__":
     test_apply_ai_result()
+    test_lead_car_penalty()
     test_candidate_counts()
     test_parse_cli_output()
     with tempfile.TemporaryDirectory(prefix="qdc_ai_") as t:
