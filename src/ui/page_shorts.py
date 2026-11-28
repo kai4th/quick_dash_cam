@@ -56,6 +56,11 @@ def slider_to_roll(value: float) -> float:
     return round(-float(value), 1) + 0.0  # + 0.0: -0.0을 0.0으로
 
 
+def fmt_roll(roll: float) -> str:
+    """화면에 보이는 기울기 숫자: 슬라이더 방향 기준(오른쪽 = +). 저장값 roll_adjust와는 부호가 반대."""
+    return f"{-float(roll) + 0.0:+.1f}°"
+
+
 def roll_to_slider(roll: float) -> float:
     return -float(roll) + 0.0
 
@@ -435,7 +440,7 @@ class ShortsPage(ctk.CTkFrame):
                 score = f"{(c.score / max_score * 100) if max_score > 0 else 0:.0f}"
             adj = []
             if c.roll_adjust:
-                adj.append(f"{c.roll_adjust:+.1f}°")
+                adj.append(f"{fmt_roll(c.roll_adjust)}")
             if c.vp is not None:
                 adj.append("⌖")
             desc = c.reason or "-"
@@ -762,12 +767,12 @@ class ShortsPage(ctk.CTkFrame):
             return
         differing = [x for x in others if x.roll_adjust not in (None, roll) and abs((x.roll_adjust or 0.0) - roll) > 0.05]
         if differing and not messagebox.askyesno(
-                "기울기 전체 적용", f"사용 중인 다른 컷 {len(others)}개의 기울기를 모두 {roll:+.1f}°로 바꿀까요?\n"
+                "기울기 전체 적용", f"사용 중인 다른 컷 {len(others)}개의 기울기를 모두 {fmt_roll(roll)}로 바꿀까요?\n"
                                    f"(따로 맞춰 둔 컷 {len(differing)}개도 바뀝니다)"):
             return
         for x in others:
             x.roll_adjust = roll
-        self.app.set_status(f"↻ 사용 중인 컷 {len(others) + 1}개 모두 기울기 {roll:+.1f}°로 맞췄습니다.")
+        self.app.set_status(f"↻ 사용 중인 컷 {len(others) + 1}개 모두 기울기 {fmt_roll(roll)}로 맞췄습니다.")
         self.store.emit("highlights")
 
     def _after_adjust(self) -> None:
@@ -796,7 +801,7 @@ class ShortsPage(ctk.CTkFrame):
         self.cut_title.configure(text=f"컷 #{(self.index or 0) + 1} · {pos} · {c.video.filename} {format_duration(c.start_sec)}"
                                       f"{' · ' + c.reason if c.reason else ''}")
         roll = c.roll_adjust or 0.0
-        self.roll_value.configure(text=f"{roll:+.1f}°")
+        self.roll_value.configure(text=fmt_roll(roll))
         self.range_label.configure(text=f"{format_duration(c.start_sec, True)} ~ {format_duration(c.end_sec, True)}  ({c.duration:.1f}초)")
         target = self._target()
         self.vp_label.configure(text=("✔ 지정됨" if c.vp is not None else "✕ 미지정 — 화면을 클릭해 지정"),

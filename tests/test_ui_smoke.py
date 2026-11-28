@@ -138,13 +138,16 @@ def main() -> int:
         # 기울기 슬라이더: 오른쪽(+)으로 밀면 반시계(roll_adjust 음수), 저장값의 의미는 그대로
         sp._on_roll_slider(3.0)
         assert sp.selected().roll_adjust == -3.0, 'slider right = counter-clockwise (negative roll)'
+        assert sp.roll_value.cget('text') == '+3.0°', 'display: slider right shows +'
         sp._on_roll_slider(-2.5)
         assert sp.selected().roll_adjust == 2.5, 'slider left = clockwise (positive roll)'
+        assert sp.roll_value.cget('text') == '-2.5°', 'display: slider left shows -'
         sp._on_roll_slider(0.0)
         assert sp.selected().roll_adjust == 0.0 and str(sp.selected().roll_adjust) == '0.0', 'no -0.0'
         sp.selected().roll_adjust = -1.5
         sp._update_cut_panel()
         assert abs(sp.roll_slider.get() - 1.5) < 1e-6, 'panel shows stored roll mirrored on the slider'
+        assert sp.roll_value.cget('text') == '+1.5°', 'label follows slider direction'
         yield 0.5
         geom = sp.player.image_geom
         assert geom is not None, "cut frame shown in the big preview"
