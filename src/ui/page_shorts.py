@@ -50,6 +50,15 @@ from .widgets import Section, card, field_label, make_tree, stylize_entry_isolat
 THUMB_W, THUMB_H = 80, 45
 ROLL_LIMIT = 10.0
 
+
+def slider_to_roll(value: float) -> float:
+    """기울기 슬라이더 위치 → 컷에 저장되는 기울기(roll_adjust, +=시계). 슬라이더 방향만 뒤집고 저장 의미는 그대로."""
+    return round(-float(value), 1) + 0.0  # + 0.0: -0.0을 0.0으로
+
+
+def roll_to_slider(roll: float) -> float:
+    return -float(roll) + 0.0
+
 AI_MODES = {"Claude Code (구독 계정)": AiDirectorMode.CLAUDE_CODE, "Claude API (API 키)": AiDirectorMode.CLAUDE_API,
             "알고리즘만 (빠름·오프라인)": AiDirectorMode.OFF}
 LENGTHS = {"15초": 15.0, "30초": 30.0, "45초": 45.0, "60초": 60.0, "90초": 90.0}
@@ -220,14 +229,16 @@ class ShortsPage(ctk.CTkFrame):
         r2.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
         r2.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(r2, text="기울기", font=font(13, True), anchor="w").grid(row=0, column=0, padx=(0, 6))
-        for col, (txt, d) in ((1, ("↺1°", -1.0)), (2, ("↺.1°", -0.1))):
+        # 슬라이더는 오른쪽으로 밀수록 반시계(↺, 값 -), 왼쪽이 시계(↻, 값 +): 저장값(roll_adjust)의 부호는 그대로이고 화면 방향만 반대.
+        # 슬라이더 양옆 버튼도 같은 방향이 되도록 왼쪽 = ↻, 오른쪽 = ↺.
+        for col, (txt, d) in ((1, ("↻1°", 1.0)), (2, ("↻.1°", 0.1))):
             ctk.CTkButton(r2, text=txt, width=48, height=30, fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
                           command=lambda d=d: self.rotate(d)).grid(row=0, column=col, padx=1)
         self.roll_slider = ctk.CTkSlider(r2, from_=-ROLL_LIMIT, to=ROLL_LIMIT, number_of_steps=int(ROLL_LIMIT * 20),
                                          command=self._on_roll_slider)
         self.roll_slider.set(0.0)
         self.roll_slider.grid(row=0, column=3, sticky="ew", padx=6)
-        for col, (txt, d) in ((4, ("↻.1°", 0.1)), (5, ("↻1°", 1.0))):
+        for col, (txt, d) in ((4, ("↺.1°", -0.1)), (5, ("↺1°", -1.0))):
             ctk.CTkButton(r2, text=txt, width=48, height=30, fg_color=NEUTRAL, hover_color=NEUTRAL_HOVER,
                           command=lambda d=d: self.rotate(d)).grid(row=0, column=col, padx=1)
         self.roll_value = ctk.CTkLabel(r2, text="+0.0°", font=font(18, True), text_color="#facc15", width=70)
@@ -585,7 +596,7 @@ class ShortsPage(ctk.CTkFrame):
         small = cv2.resize(arr, (int(w * scale) + 2, int(h * scale) + 2), interpolation=cv2.INTER_AREA)
         y0, x0 = (small.shape[0] - sh) // 2, (small.shape[1] - sw) // 2
         bg = cv2.GaussianBlur(small[y0:y0 + sh, x0:x0 + sw], (0, 0), 4)
-        out = (cv2.resize(bg, (ow, oh), interpolation=cv2.INTER_LINEAR).astype(np.float32) * 0.82).astype(np.uint8)
+        out = cv2.resize(cv2.convertScaleAbs(bg, alpha=0.82), (ow, oh), interpolation=cv2.INTER_LINEAR)  # 어둡게는 작은 그림에서 먼저(float 변환보다 약 10배 빠름)
         fh = min(oh, int(round(h * ow / w)))
         fg = cv2.resize(arr, (ow, fh), interpolation=cv2.INTER_AREA)
         fy = (oh - fh) // 2
@@ -694,7 +705,7 @@ class ShortsPage(ctk.CTkFrame):
         c = self.selected()
         if c is None:
             return
-        c.roll_adjust = round(float(value), 1)
+        c.roll_adjust = slider_to_roll(value)
         self._after_adjust()
 
     def clear_vp(self) -> None:
@@ -770,7 +781,7 @@ class ShortsPage(ctk.CTkFrame):
     def _update_cut_panel(self) -> None:
         c = self.selected()
         self._suppress_slider = True
-        self.roll_slider.set((c.roll_adjust or 0.0) if c is not None else 0.0)
+        self.roll_slider.set(roll_to_slider(c.roll_adjust or 0.0) if c is not None else 0.0)
         self._suppress_slider = False
         if c is None:
             self.cut_title.configure(text="장면을 고르면 여기에서 확인하고 기울기·소실점을 맞출 수 있습니다")

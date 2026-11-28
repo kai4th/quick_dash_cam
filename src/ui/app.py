@@ -18,7 +18,7 @@ from ..ffmpeg_utils import detect_best_gpu_decoder, detect_best_h264_encoder
 from . import persist
 from .media import ThumbnailLoader
 from .state import AppState
-from .theme import BG_APP, BG_PANEL, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, font, format_duration
+from .theme import BG_APP, BG_PANEL, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, font, format_duration, enable_high_res_timer
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -38,6 +38,7 @@ class JobCancelled(Exception):
 class QuickDashCamApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        enable_high_res_timer()
         self.title("QuickDashCam — 주행 영상 편집 · 하이라이트 쇼츠")
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         w, h = min(1600, int(sw * 0.92)), min(1000, int(sh * 0.88))

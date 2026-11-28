@@ -17,7 +17,7 @@ import customtkinter as ctk
 import numpy as np
 
 from .media import PlaybackClip, PlaybackWorker, PlayPiece, PreviewFrameWorker, build_pieces
-from .theme import BG_DEEP, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, ACCENT, ACCENT_HOVER, font, format_duration, make_photo_image
+from .theme import BG_DEEP, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, ACCENT, ACCENT_HOVER, font, format_duration, make_photo_image, photo_put_rgb
 
 RATES = ["0.5x", "1x", "2x", "4x", "8x"]
 
@@ -285,7 +285,7 @@ class VideoPlayer(ctk.CTkFrame):
             if self.on_position:
                 self.on_position(self.position)
             return
-        self._poll_job = self.after(8, self._poll)
+        self._poll_job = self.after(4, self._poll)
 
     def _set_play_button(self) -> None:
         if self.btn_play is not None:
@@ -332,9 +332,7 @@ class VideoPlayer(ctk.CTkFrame):
         else:
             cv.delete("all")
         if self._photo is not None and self._photo_size == (w, h) and self._img_item is not None:
-            if not arr.flags["C_CONTIGUOUS"]:
-                arr = np.ascontiguousarray(arr)
-            self._photo.put(f"P6 {w} {h} 255\n".encode("ascii") + arr.tobytes())
+            photo_put_rgb(self._photo, arr)
             cv.coords(self._img_item, cw // 2, ch // 2)
         else:
             if self._img_item is not None:

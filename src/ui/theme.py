@@ -73,3 +73,93 @@ def make_photo_image(img_or_arr: Union[np.ndarray, object]) -> tk.PhotoImage:
         h, w = arr.shape[:2]
         ppm = f"P6 {w} {h} 255\n".encode("ascii") + arr.tobytes()
     return tk.PhotoImage(data=ppm)
+
+
+# ── 프레임 고속 갱신 ──
+# PhotoImage.put(P6 데이터)는 Tk가 픽셀마다 PPM을 해석해서 메인(UI) 스레드에서 720p 한 장에 약 17ms, 1080p는 약 40ms+가 듭니다.
+# 재생 중 프레임마다 이 비용을 내면 30fps(33ms 예산)를 못 맞추고 화면이 뚝뚝 끊깁니다.
+# 같은 Tk가 제공하는 Tk_PhotoPutBlock(C 함수)을 ctypes로 직접 불러 RGB 버퍼를 그대로 복사하면 약 4배 빠릅니다.
+# 별도 확장 DLL(_imagingtk 등)이 아니라 파이썬이 이미 로드한 tk DLL의 함수만 쓰므로 WDAC 환경에서도 동작하며,
+# 어떤 이유로든 실패하면 기존 PPM 방식으로 자동 전환합니다.
+import ctypes as _ct
+import glob as _glob
+import os as _os
+import sys as _sys
+
+
+class _TkImageBlock(_ct.Structure):
+    _fields_ = [("pixelPtr", _ct.c_void_p), ("width", _ct.c_int), ("height", _ct.c_int),
+                ("pitch", _ct.c_int), ("pixelSize", _ct.c_int), ("offset", _ct.c_int * 4)]
+
+
+_fast_put = None      # (find_photo, put_block) 또는 False(사용 불가)
+
+
+def _load_fast_put():
+    global _fast_put
+    if _fast_put is not None:
+        return _fast_put
+    _fast_put = False
+    try:
+        names = ["tk86t.dll", "tk86.dll", "tk90.dll"] if _sys.platform == "win32" else []
+        dll = None
+        base = _os.path.dirname(_sys.executable)
+        for n in names:
+            for d in (_os.path.join(base, "DLLs"), base):
+                p = _os.path.join(d, n)
+                if _os.path.exists(p):
+                    dll = _ct.CDLL(p)
+                    break
+            if dll is not None:
+                break
+        if dll is None:  # macOS/Linux: 이미 로드된 tk 라이브러리를 찾음
+            import ctypes.util
+            lib = ctypes.util.find_library("tk8.6") or ctypes.util.find_library("tk")
+            dll = _ct.CDLL(lib) if lib else None
+        if dll is None:
+            return _fast_put
+        find = dll.Tk_FindPhoto
+        find.restype = _ct.c_void_p
+        find.argtypes = [_ct.c_void_p, _ct.c_char_p]
+        put = dll.Tk_PhotoPutBlock
+        put.restype = _ct.c_int
+        put.argtypes = [_ct.c_void_p, _ct.c_void_p, _ct.POINTER(_TkImageBlock),
+                        _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int, _ct.c_int]
+        _fast_put = (find, put)
+    except Exception:
+        _fast_put = False
+    return _fast_put
+
+
+def photo_put_rgb(photo: tk.PhotoImage, arr: np.ndarray) -> None:
+    """PhotoImage(photo)의 내용을 (H, W, 3) uint8 RGB 배열로 교체합니다. 크기는 photo와 같아야 합니다."""
+    fast = _load_fast_put()
+    if fast and arr.ndim == 3 and arr.shape[2] == 3:
+        try:
+            if not arr.flags["C_CONTIGUOUS"]:
+                arr = np.ascontiguousarray(arr)
+            h, w = arr.shape[:2]
+            tk_app = photo.tk
+            interp = tk_app.interpaddr()
+            handle = fast[0](interp, str(photo).encode("ascii"))
+            if handle:
+                blk = _TkImageBlock(arr.ctypes.data, w, h, w * 3, 3, (0, 1, 2, 0))
+                # compRule 1 = TK_PHOTO_COMPOSITE_SET (알파 합성 없이 그대로 덮어쓰기)
+                if fast[1](interp, handle, _ct.byref(blk), 0, 0, w, h, 1) == 0:
+                    return
+        except Exception:
+            pass
+        globals()["_fast_put"] = False  # 한 번 실패하면 계속 시도하지 않음
+    h, w = arr.shape[:2]
+    photo.put(f"P6 {w} {h} 255\n".encode("ascii") + np.ascontiguousarray(arr).tobytes())
+
+
+def enable_high_res_timer() -> None:
+    """Windows 기본 타이머 해상도는 약 15.6ms라 30fps 재생 프레임 표시 시각이 ±15ms 흔들립니다(31·31·46ms 식으로 불규칙).
+    1ms 해상도로 올리면 프레임 간격이 고르게 유지됩니다. 프로세스가 끝나면 자동으로 원복됩니다."""
+    if _sys.platform != "win32":
+        return
+    try:
+        _ct.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
