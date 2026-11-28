@@ -312,6 +312,7 @@ SURPRISE_PENALTY = 0.6   # 주변 흐름 대비 급격한 화면 변화 감점 �
 SCENE_EXCESS_START = 0.7  # 화면 변화량이 상위 수준을 넘는 만큼 감점 시작
 SLOW_SPEED_MIN = 0.35    # 아주 느린 주행(주차장·골목)의 최소 배율
 STEER_SCALE_FLOOR = 1.5   # 회전이 거의 없는 주행에서 차선 안 미세한 흔들림을 '회전'으로 오인하지 않도록 정규화 하한
+STOP_MARGIN_SEC = 3.0     # 정차·잘라내기 구간 앞뒤 이만큼도 컷에서 제외 (분석이 정차 앞뒤 1초를 일반 주행으로 남기고, 속도는 2.5초 중앙값이라 '멈춰 있다 출발'하는 컷이 새어 들어옴)
 MIN_WINDOW_QUALITY = 0.15  # 이보다 불안정한 컷은 '다르게 보여도' 쓰지 않음 (어지러운 컷보다 컷 수가 모자란 게 나음)
 
 
@@ -412,6 +413,17 @@ REASON_QUOTA_RATIO = 0.4  # (대체 선정 방식) 같은 선정 이유의 장�
 Window = Tuple[int, int, float]  # (video_idx, start_index, window_mean_score)
 
 
+def _dilate_mask(mask: np.ndarray, steps: int) -> np.ndarray:
+    """True 구간을 앞뒤로 steps 샘플씩 넓힘."""
+    if steps <= 0 or not mask.any():
+        return mask
+    c = np.concatenate([[0.0], np.cumsum(mask.astype(np.float64))])
+    n = len(mask)
+    lo = np.clip(np.arange(n) - steps, 0, n)
+    hi = np.clip(np.arange(n) + steps + 1, 0, n)
+    return (c[hi] - c[lo]) > 0
+
+
 def _window_table(
     videos: List[VideoFileInfo],
     scored: List[Optional[Dict[str, np.ndarray]]],
@@ -436,6 +448,8 @@ def _window_table(
             means = 0.5 * means + 0.5 * mins
             ccut = np.concatenate([[0.0], np.cumsum(cut, dtype=np.float64)])
             has_cut = (ccut[win:] - ccut[:-win]) > 0
+            if STOP_MARGIN_SEC > 0:
+                blocked = _dilate_mask(blocked, int(round(STOP_MARGIN_SEC * fps)))
             cblk = np.concatenate([[0.0], np.cumsum(blocked, dtype=np.float64)])
             # 정차 순간이 섞인 컷은 제외 (멈춰 있다 출발하는 것도 컷 안의 큰 변화)
             any_blocked = (cblk[win:] - cblk[:-win]) > 0
