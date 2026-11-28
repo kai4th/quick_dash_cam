@@ -144,6 +144,16 @@ def main() -> int:
         assert sp.roll_value.cget('text') == '-2.5°', 'display: slider left shows -'
         sp._on_roll_slider(0.0)
         assert sp.selected().roll_adjust == 0.0 and str(sp.selected().roll_adjust) == '0.0', 'no -0.0'
+        # 화살표 키: → = 슬라이더 오른쪽 = 표시값 증가(저장값 감소), ← 반대
+        from types import SimpleNamespace as _Ev
+        sp.selected().roll_adjust = 0.0
+        sp.handle_key(_Ev(keysym='Right', state=0))
+        assert sp.selected().roll_adjust == -0.1 and sp.roll_value.cget('text') == '+0.1°', 'Right key matches slider right'
+        assert abs(sp.roll_slider.get() - 0.1) < 1e-6
+        sp.handle_key(_Ev(keysym='Left', state=1))
+        assert sp.selected().roll_adjust == 0.9 and sp.roll_value.cget('text') == '-0.9°', 'Shift+Left = 1 degree toward slider left'
+        from src.ui.page_shorts import fmt_roll
+        assert fmt_roll(0.04) == '+0.0°' and fmt_roll(-0.04) == '+0.0°', 'no -0.0 display'
         sp.selected().roll_adjust = -1.5
         sp._update_cut_panel()
         assert abs(sp.roll_slider.get() - 1.5) < 1e-6, 'panel shows stored roll mirrored on the slider'

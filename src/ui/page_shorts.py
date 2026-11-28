@@ -58,7 +58,7 @@ def slider_to_roll(value: float) -> float:
 
 def fmt_roll(roll: float) -> str:
     """화면에 보이는 기울기 숫자: 슬라이더 방향 기준(오른쪽 = +). 저장값 roll_adjust와는 부호가 반대."""
-    return f"{-float(roll) + 0.0:+.1f}°"
+    return f"{round(-float(roll), 1) + 0.0:+.1f}°"
 
 
 def roll_to_slider(roll: float) -> float:
@@ -981,7 +981,7 @@ class ShortsPage(ctk.CTkFrame):
         elif k in ("x", "X"):
             self.toggle_use()
         elif k in ("Left", "Right"):
-            self.rotate((-1 if k == "Left" else 1) * (1.0 if shift else 0.1))
+            self.rotate((1 if k == "Left" else -1) * (1.0 if shift else 0.1))  # 슬라이더·버튼과 같은 방향: ← = 슬라이더 왼쪽 = 시계(+저장값)
         elif k == "comma":
             self.shift_cut(-0.5)
         elif k == "period":

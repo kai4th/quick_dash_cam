@@ -93,6 +93,7 @@ class VideoPlayer(ctk.CTkFrame):
     def set_clips(self, clips: List[PlaybackClip]) -> None:
         self.stop()
         self.clips = list(clips)
+        self._playback.forget_missing([c.path for c in self.clips])
         self.total = sum(c.duration for c in self.clips)
         self.position = min(self.position, self.total)
         self._raw = None
@@ -136,7 +137,8 @@ class VideoPlayer(ctk.CTkFrame):
         if found is None:
             return
         clip, local = found
-        self._playback.warm(clip.path)  # 재생 버튼을 누르기 전에 영상을 미리 열어 첫 프레임 대기를 줄임
+        if self.winfo_ismapped():   # 보이는 화면에서만 (다른 탭의 플레이어까지 같은 파일을 미리 열면 디코더가 중복 점유됨)
+            self._playback.warm(clip.path)  # 재생 버튼을 누르기 전에 영상을 미리 열어 첫 프레임 대기를 줄임
         self._preview.request_frame(clip.path, local, max(160, self.canvas.winfo_width()),
                                     max(90, self.canvas.winfo_height()))
 

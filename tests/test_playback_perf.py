@@ -69,6 +69,7 @@ def test_playback_backends() -> None:
     media.open_hw_capture = lambda _p: None  # 캡처를 못 열 때
     try:
         w3 = media.PlaybackWorker()
+        w3._pool.keep_only([])   # 공유 풀에 남은 캡처를 비워 '열기 실패'를 재현
         got3 = _play_all(w3, pieces(), 1.0)
     finally:
         media.open_hw_capture = orig
@@ -78,7 +79,44 @@ def test_playback_backends() -> None:
         x.close()
 
 
+def test_pool_close_and_unhealthy() -> None:
+    """풀을 닫은 뒤 반납된 캡처는 다시 적재되지 않고 해제되며, 오류가 난 캡처도 재사용하지 않는다."""
+    from src.ui import media
+
+    class FakeCap:
+        released = 0
+
+        def release(self):
+            FakeCap.released += 1
+
+    pool = media._CapturePool()
+    pool.release(Path("a.mp4"), FakeCap())            # 정상 반납 → 유휴 목록에 보관
+    assert len(pool._idle) == 1 and FakeCap.released == 0
+    pool.release(Path("b.mp4"), FakeCap(), healthy=False)   # 오류 캡처 → 바로 해제
+    assert len(pool._idle) == 1 and FakeCap.released == 1
+    pool.keep_only([Path("zzz.mp4")])                 # 목록에서 사라진 파일 → 해제
+    assert not pool._idle and FakeCap.released == 2
+    pool.release(Path("a.mp4"), FakeCap())
+    pool.close()
+    assert FakeCap.released == 3 and not pool._idle, "close releases idle captures synchronously"
+    pool.release(Path("c.mp4"), FakeCap())            # 닫힌 뒤 반납 → 적재하지 않고 해제
+    assert not pool._idle and FakeCap.released == 4, "release after close must not re-pool"
+    assert pool.acquire(Path("a.mp4")) is None, "closed pool hands out nothing"
+    pool.warm(Path("a.mp4"))                          # 닫힌 풀에서는 미리 열기도 하지 않음
+    assert not pool._opening
+    print("[PASS] capture pool: close / unhealthy / keep_only")
+
+
+def test_roll_note_sign() -> None:
+    from src.ui.page_shorts import fmt_roll, roll_to_slider, slider_to_roll
+    assert fmt_roll(-3.0) == "+3.0°" and fmt_roll(2.5) == "-2.5°"
+    assert slider_to_roll(roll_to_slider(1.7)) == 1.7
+    print("[PASS] roll display sign")
+
+
 def main() -> int:
+    test_pool_close_and_unhealthy()
+    test_roll_note_sign()
     test_playback_backends()
     root = tk.Tk()
     h, w = 360, 640
@@ -98,6 +136,10 @@ def main() -> int:
     theme.photo_put_rgb(ph, np.asfortranarray(non_contig))
     assert ph.get(9, 9) == tuple(int(v) for v in a[9, 9]), "non-contiguous input handled"
     print("[PASS] photo_put_rgb matches PPM path pixel-for-pixel; fast path:", bool(theme._fast_put))
+    # uint8이 아닌 배열은 빠른 경로를 쓰지 않고 PPM 경로로 (잘못된 메모리 해석 방지)
+    theme.photo_put_rgb(ph, a)
+    theme.photo_put_rgb(ph, np.zeros((h, w, 3), dtype=np.uint16))   # 예외 없이 처리되어야 함
+    assert theme._fast_put is not False or sys.platform != "win32", "dtype mismatch must not disable the fast path"
 
     big = rng.integers(0, 256, (720, 1280, 3), dtype=np.uint8)
     bp = tk.PhotoImage(width=1280, height=720)

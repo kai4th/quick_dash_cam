@@ -1516,7 +1516,7 @@ def render_highlight_shorts(
         if c.roll_adjust is not None:
             roll_by_clip[idx] = c.roll_adjust
             if notes is not None and (abs(c.roll_adjust) >= 0.05 or vp_txt):
-                notes.append(f"화면 맞춤: {where} 기울기 {c.roll_adjust:+.1f}° (수동){vp_txt}")
+                notes.append(f"화면 맞춤: {where} 기울기 {round(-c.roll_adjust, 1) + 0.0:+.1f}° (수동){vp_txt}")  # 화면 표시와 같은 부호(슬라이더 방향 기준)
             continue
         if cfg.auto_level:
             if cancel_check and cancel_check():
