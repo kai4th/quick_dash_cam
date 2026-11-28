@@ -163,3 +163,14 @@ def enable_high_res_timer() -> None:
         _ct.windll.winmm.timeBeginPeriod(1)
     except Exception:
         pass
+    try:
+        # Windows 11은 창이 가려지거나 포커스가 없는 프로세스의 타이머 해상도 요청을 무시해 15.6ms 단위로 되돌립니다.
+        # 이 무시 동작을 끄면 재생 중 프레임 표시 시각이 15.6ms 배수(31·46ms)로 튀지 않습니다.
+        class _PowerThrottling(_ct.Structure):
+            _fields_ = [("Version", _ct.c_ulong), ("ControlMask", _ct.c_ulong), ("StateMask", _ct.c_ulong)]
+        st = _PowerThrottling(1, 0x4, 0x0)  # PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 해제
+        k32 = _ct.windll.kernel32
+        k32.GetCurrentProcess.restype = _ct.c_void_p
+        k32.SetProcessInformation(_ct.c_void_p(k32.GetCurrentProcess()), 4, _ct.byref(st), _ct.sizeof(st))  # ProcessPowerThrottling = 4
+    except Exception:
+        pass

@@ -20,6 +20,7 @@ from .media import PlaybackClip, PlaybackWorker, PlayPiece, PreviewFrameWorker, 
 from .theme import BG_DEEP, FG_MUTED, NEUTRAL, NEUTRAL_HOVER, ACCENT, ACCENT_HOVER, font, format_duration, make_photo_image, photo_put_rgb
 
 RATES = ["0.5x", "1x", "2x", "4x", "8x"]
+MAX_VIDEO_PIXELS = 2_000_000   # 재생 중 프레임 화소 수 상한 (Tk 그리기 비용 때문)
 
 
 class VideoPlayer(ctk.CTkFrame):
@@ -135,6 +136,7 @@ class VideoPlayer(ctk.CTkFrame):
         if found is None:
             return
         clip, local = found
+        self._playback.warm(clip.path)  # 재생 버튼을 누르기 전에 영상을 미리 열어 첫 프레임 대기를 줄임
         self._preview.request_frame(clip.path, local, max(160, self.canvas.winfo_width()),
                                     max(90, self.canvas.winfo_height()))
 
@@ -221,10 +223,17 @@ class VideoPlayer(ctk.CTkFrame):
         return pieces
 
     def _launch(self) -> None:
-        self._session = self._playback.start(
-            self._pieces(), rate=self.rate(),
-            box_w=max(160, self.canvas.winfo_width()), box_h=max(90, self.canvas.winfo_height()),
-        )
+        bw, bh = self._video_box()
+        self._session = self._playback.start(self._pieces(), rate=self.rate(), box_w=bw, box_h=bh)
+
+    def _video_box(self) -> Tuple[int, int]:
+        """재생 프레임 크기 상한. Tk가 프레임을 화면에 올리는 비용은 화소 수에 비례(약 7ns/화소, 창을 최대화한 4K 화면 캔버스
+        2400x1350에서 프레임당 약 24ms로 30fps 예산 33ms를 거의 다 씀)하므로, 재생 중에는 약 200만 화소까지로 제한합니다."""
+        w, h = max(160, self.canvas.winfo_width()), max(90, self.canvas.winfo_height())
+        if w * h > MAX_VIDEO_PIXELS:
+            k = (MAX_VIDEO_PIXELS / float(w * h)) ** 0.5
+            w, h = max(160, int(w * k)), max(90, int(h * k))
+        return w, h
 
     def _schedule_restart(self) -> None:
         if self._restart_job is not None:
@@ -387,5 +396,5 @@ class VideoPlayer(ctk.CTkFrame):
                     self.after_cancel(job)
                 except Exception:
                     pass
-        self._playback.stop()
+        self._playback.close()
         self._preview.close()

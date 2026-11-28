@@ -77,7 +77,7 @@ class PreviewFrameWorker:
                 if self._cap is None or self._cap_path != v_path:
                     if self._cap is not None:
                         self._cap.release()
-                    self._cap = cv2.VideoCapture(str(v_path))
+                    self._cap = open_hw_capture(v_path)
                     self._cap_path = v_path
 
                 if self._cap and self._cap.isOpened():
@@ -189,6 +189,7 @@ class _Decoder:
         self.h = max(2, int(clip.height * scale) // 2 * 2)
         self.piece = piece
         self.noref = skip_noref
+        self.done = False
         self.got_any = False
         self._closed = False
         frame_bytes = self.w * self.h * 3
@@ -235,6 +236,7 @@ class _Decoder:
                     return
         except Exception:
             pass
+        self.done = True
         self._put(None)  # 끝 표시
 
     def _put(self, item: Optional[np.ndarray]) -> bool:
@@ -271,6 +273,179 @@ class _Decoder:
             pass
 
 
+def open_hw_capture(path: Path) -> Optional["cv2.VideoCapture"]:
+    """하드웨어 디코딩(D3D11VA 등)으로 OpenCV 캡처를 엽니다. 실패하면 소프트웨어 디코딩, 그것도 안 되면 None."""
+    for params in ([cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY], None):
+        try:
+            cap = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG, params) if params else cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+            if cap is not None and cap.isOpened():
+                return cap
+            if cap is not None:
+                cap.release()
+        except Exception:
+            continue
+    return None
+
+
+class _CapturePool:
+    """
+    열어 둔 OpenCV 캡처를 파일별로 재사용합니다.
+    영상 하나를 열 때마다 파일 색인(moov)을 읽고 하드웨어 디코더를 초기화하느라 0.3~1초 이상 걸리고(4K60 블랙박스 기준),
+    ffmpeg 프로세스를 컷마다 새로 띄우면 컷 경계·재생 시작마다 1~3초씩 멈춥니다.
+    열린 캡처에서 위치만 옮기면(set POS_MSEC) 컷 전환이 약 0.15~0.3초로 줄어듭니다.
+    """
+
+    MAX_IDLE = 4
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: List[Tuple[str, "cv2.VideoCapture"]] = []
+        self._opening: Dict[str, threading.Event] = {}
+
+    def acquire(self, path: Path):
+        key = str(path)
+        with self._lock:
+            pending = self._opening.get(key)
+        if pending is not None:
+            pending.wait(5.0)           # 미리 열기가 진행 중이면 그것을 기다려 재사용 (같은 파일을 두 번 열면 0.3초+ 낭비)
+        with self._lock:
+            for i, (k, cap) in enumerate(self._idle):
+                if k == key:
+                    del self._idle[i]
+                    return cap
+        return open_hw_capture(path)
+
+    def warm(self, path: Path) -> None:
+        """재생 전에 미리 열어 두기 (백그라운드)."""
+        key = str(path)
+        with self._lock:
+            if key in self._opening or any(k == key for k, _c in self._idle):
+                return
+            ev = self._opening[key] = threading.Event()
+
+        def run():
+            try:
+                cap = open_hw_capture(path)
+                if cap is not None:
+                    self.release(path, cap)
+            finally:
+                with self._lock:
+                    self._opening.pop(key, None)
+                ev.set()
+        threading.Thread(target=run, daemon=True).start()
+
+    def release(self, path: Path, cap) -> None:
+        extra = []
+        with self._lock:
+            self._idle.append((str(path), cap))
+            while len(self._idle) > self.MAX_IDLE:
+                extra.append(self._idle.pop(0)[1])
+        for c in extra:
+            try:
+                c.release()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        with self._lock:
+            caps, self._idle = [c for _k, c in self._idle], []
+
+        def run():
+            for c in caps:
+                try:
+                    c.release()
+                except Exception:
+                    pass
+        threading.Thread(target=run, daemon=True).start()
+
+
+class _CvDecoder:
+    """
+    열어 둔 하드웨어 디코딩 캡처에서 한 조각을 읽는 디코더 (_Decoder와 같은 인터페이스: q / got_any / failed / close).
+    - 프로세스를 새로 띄우지 않고 위치만 옮기므로 컷 전환·재생 시작이 빠름
+    - 60fps 원본은 모든 프레임을 디코딩하되(참조 관계 때문) 표시할 프레임만 변환·축소
+    - 읽기 스레드가 앞서 디코딩해 큐에 쌓아 둠
+    """
+
+    QUEUE_BYTES = 48 * 1024 * 1024
+    noref = True   # 프레임 건너뛰기 재시작 로직 대상 아님
+
+    def __init__(self, piece: PlayPiece, out_fps: float, box_w: int, box_h: int, pool: _CapturePool) -> None:
+        clip = piece.clip
+        scale = min(box_w / max(1, clip.width), box_h / max(1, clip.height))
+        self.w = max(2, int(clip.width * scale) // 2 * 2)
+        self.h = max(2, int(clip.height * scale) // 2 * 2)
+        self.piece = piece
+        self.out_fps = out_fps
+        self.got_any = False
+        self.error = False
+        self.done = False
+        self._closed = False
+        self._pool = pool
+        frame_bytes = self.w * self.h * 3
+        self.q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(
+            maxsize=max(3, min(24, self.QUEUE_BYTES // max(1, frame_bytes))))
+        self._thread = threading.Thread(target=self._read, daemon=True)
+        self._thread.start()
+
+    def _read(self) -> None:
+        piece, clip = self.piece, self.piece.clip
+        cap = None
+        try:
+            cap = self._pool.acquire(clip.path)
+            if cap is None:
+                self.error = True
+                return
+            end = clip.duration if piece.local_end is None else min(clip.duration, piece.local_end)
+            start = piece.local_start
+            cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
+            src_fps = max(1.0, clip.fps or cap.get(cv2.CAP_PROP_FPS) or 30.0)
+            slot = 0                      # 다음에 내보낼 표시 프레임 번호 (시각 = start + slot / out_fps)
+            while not self._closed:
+                if not cap.grab():
+                    break
+                ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if ts >= end - 1e-3:
+                    break
+                if ts + 0.25 / src_fps < start + slot / self.out_fps:
+                    continue              # 표시 간격보다 촘촘한 프레임은 디코딩만 하고 건너뜀
+                ok, bgr = cap.retrieve()
+                if not ok or bgr is None:
+                    break
+                small = cv2.resize(bgr, (self.w, self.h), interpolation=cv2.INTER_LINEAR)  # AREA는 4K에서 프레임당 약 5ms 더 듦
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                self.got_any = True
+                # 원본 프레임이 표시 간격보다 드문 경우(저fps 원본 느린 재생 등)에는 같은 프레임을 반복
+                while ts + 0.25 / src_fps >= start + slot / self.out_fps and not self._closed:
+                    if not self._put(rgb):
+                        return
+                    slot += 1
+        except Exception:
+            self.error = not self.got_any
+        finally:
+            if cap is not None:
+                self._pool.release(clip.path, cap)
+            if self.got_any is False and cap is None:
+                self.error = True
+            self.done = True
+            self._put(None)
+
+    def _put(self, item: Optional[np.ndarray]) -> bool:
+        while not self._closed:
+            try:
+                self.q.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def failed(self) -> bool:
+        return self.error or not self.got_any
+
+    def close(self) -> None:
+        self._closed = True
+
+
 class PlaybackWorker:
     """
     실제 동영상 플레이어처럼 끊김 없이 재생하기 위한 스트리밍 재생 워커.
@@ -281,7 +456,7 @@ class PlaybackWorker:
     """
 
     DISPLAY_FPS = 30.0
-    PREFETCH_SEC = 1.5
+    PREFETCH_SEC = 2.5
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -291,7 +466,10 @@ class PlaybackWorker:
         self._finished_session: int = -1
         self._hw: Optional[str] = None      # 첫 재생 때 감지: cuda / d3d11va / videotoolbox / auto / none
         self._force_noref = False           # 디코딩이 실시간을 못 따라간 적이 있으면 이후 계속 사용
-        self.stats = {"shown": 0, "late": 0, "restarts": 0, "hw": ""}
+        self._cv_ok = True                  # 열어 둔 하드웨어 캡처 디코딩 사용 가능 여부 (실패하면 ffmpeg 프로세스 방식으로 전환)
+        self._pool = _CapturePool()
+        self.stats = {"shown": 0, "late": 0, "restarts": 0, "hw": "", "backend": ""}
+        self.trace: Optional[list] = None  # 측정용: (원래 표시 예정 시각 직전, 게시 시각, 미디어 시간)
 
     @property
     def session(self) -> int:
@@ -338,7 +516,20 @@ class PlaybackWorker:
         self.stats["hw"] = self._hw
         return self._hw
 
-    def _open(self, piece: PlayPiece, rate: float, box_w: int, box_h: int) -> _Decoder:
+    def warm(self, path: Path) -> None:
+        """재생 시작 전에 영상을 미리 열어 두어 첫 프레임까지의 대기를 줄임."""
+        if self._cv_ok:
+            self._pool.warm(path)
+
+    def close(self) -> None:
+        self.stop()
+        self._pool.close()
+
+    def _open(self, piece: PlayPiece, rate: float, box_w: int, box_h: int):
+        if self._cv_ok and rate <= 1.0 + 1e-6:
+            self.stats["backend"] = "capture"
+            return _CvDecoder(piece, self.DISPLAY_FPS / rate, box_w, box_h, self._pool)
+        self.stats["backend"] = "ffmpeg"
         noref = self._force_noref or rate >= 2.0 or piece.clip.fps >= 48.0
         return _Decoder(piece, self.DISPLAY_FPS / rate, box_w, box_h, self._detect_hw(), noref)
 
@@ -348,6 +539,7 @@ class PlaybackWorker:
         nxt: Optional[_Decoder] = None
         dec: Optional[_Decoder] = None
         i = 0
+        restarted = False
         try:
             while i < len(pieces) and not evt.is_set():
                 piece = pieces[i]
@@ -355,6 +547,17 @@ class PlaybackWorker:
                 wall0: Optional[float] = None
                 anchor = 0.0
                 idx = 0
+                if i == 0 or restarted:
+                    # 재생 시작·재시작 직후에는 큐를 조금 채운 뒤 시계를 시작 (디코딩이 막 시작되어 느릴 때의 초반 끊김 방지)
+                    t_pre = time.perf_counter()
+                    while not evt.is_set() and not dec.done and dec.q.empty() and time.perf_counter() - t_pre < 4.0:
+                        time.sleep(0.005)   # 첫 프레임 대기 (파일 열기·위치 이동)
+                    t_fill = time.perf_counter()
+                    while (not evt.is_set() and not dec.done and dec.q.qsize() < min(8, dec.q.maxsize)
+                           and time.perf_counter() - t_fill < 0.5):
+                        time.sleep(0.005)   # 큐를 조금 채운 뒤 시계 시작
+                    self.stats["preroll"] = (round(t_fill - t_pre, 2), round(time.perf_counter() - t_fill, 2), dec.q.qsize())
+                restarted = False
                 late_window: List[Tuple[float, float]] = []  # (벽시계, 밀린 시간)
                 restart_at: Optional[float] = None
                 while not evt.is_set():
@@ -390,6 +593,8 @@ class PlaybackWorker:
                     with self._lock:
                         if self._session == sid:
                             self._latest = (sid, media_t, arr, piece.tag)
+                            if self.trace is not None:
+                                self.trace.append((now, time.perf_counter(), media_t, dec.q.qsize()))
                     self.stats["shown"] += 1
                     if restart_at is not None:
                         break
@@ -405,6 +610,17 @@ class PlaybackWorker:
                         nxt.close()
                         nxt = None
                     pieces[i] = PlayPiece(piece.clip, restart_at + 1.0 / out_fps, piece.local_end, piece.tag)
+                    restarted = True
+                    continue
+                if isinstance(dec, _CvDecoder) and dec.failed() and piece.length > 0.2:
+                    # 캡처 디코딩 실패 → ffmpeg 프로세스 방식으로 같은 조각을 다시 재생
+                    self._cv_ok = False
+                    self.stats["restarts"] += 1
+                    dec.close()
+                    if nxt is not None:
+                        nxt.close()
+                        nxt = None
+                    restarted = True
                     continue
                 if not dec.got_any and self._hw not in (None, "none") and piece.length > 0.2 and dec.failed():
                     # GPU 디코딩 실패 → CPU 디코딩으로 같은 조각을 다시 재생
